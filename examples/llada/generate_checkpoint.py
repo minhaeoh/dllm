@@ -19,13 +19,13 @@ import accelerate
 import dllm
 from dllm.pipelines import llada
 
-data_name = "gsm8k_filter_unique_1_0_1"
+data_name = "gsm8k__1_0_1"
 
 @dataclass
 class ScriptArguments:
     model_name_or_path: str = (
-        # "/home/minhae/diffusion/dllm/models/LLaDA-8B-SFT/gsm8k-sft-111/checkpoint-795807"  # "inclusionAI/LLaDA-MoE-7B-A1B-Instruct"
-        "GSAI-ML/LLaDA-8B-Instruct"
+        "/home/minhae/diffusion/dllm/models/LLaDA-8B-SFT/gsm8k_filter_1_1_1/checkpoint-final"  # "inclusionAI/LLaDA-MoE-7B-A1B-Instruct"
+        # "GSAI-ML/LLaDA-8B-Instruct"
     )
     steps: int = 128
     max_new_tokens: int = 128
@@ -70,7 +70,7 @@ def custom_apply_chat_template(messages):
         tokenize=True,
         return_tensors="pt",
     )[0].tolist()
-    return {"q_llm_input_ids": q_llm_input_ids, "q_len": len(q_input_ids)}
+    return {"q_llm_input_ids": q_llm_input_ids, "q_input_ids": q_input_ids, "q_len": len(q_input_ids), "gold_answer": messages[-1]["content"]}
 
 def sft_map_fn(row) -> dict:
     return custom_apply_chat_template(row["messages"])
@@ -83,8 +83,10 @@ with accelerate.PartialState().local_main_process_first():
     print("filtered test dataset length: ", len(dataset))
     results = dataset.map(sft_map_fn, num_proc=data_args.num_proc, remove_columns=dataset.column_names)
     # Move to device after multiprocessing is done
-    input_ids_list = [torch.tensor(r["q_llm_input_ids"]).to(model.device) for r in results]
+    # input_ids_list = [torch.tensor(r["q_llm_input_ids"]).to(model.device) for r in results]
+    input_ids_list = [torch.tensor(r["q_input_ids"]).to(model.device) for r in results]
     q_len = [r["q_len"] for r in results]
+    gold_answer = [r["gold_answer"].split("The answer is: ")[1] for r in results]
 
 # --- Example 1: Batch generation ---
 print("\n" + "=" * 80)
@@ -103,15 +105,15 @@ for batch_start in range(0, len(input_ids_list), batch_size):
     batch_q_len = q_len[batch_start:batch_end]
     
     # Debug: print first sample info
-    if batch_start == 0:
-        print(f"\nDEBUG: First sample")
-        print(f"  Input length: {len(batch_input_ids[0])}")
-        print(f"  Question length: {batch_q_len[0]}")
-        print(f"  Max new tokens: {script_args.max_new_tokens}")
-        print(f"  Decoded input:\n{tokenizer.decode(batch_input_ids[0])}")
-        print()
+    # if batch_start == 0:
+    #     print(f"\nDEBUG: First sample")
+    #     print(f"  Input length: {len(batch_input_ids[0])}")
+    #     print(f"  Question length: {batch_q_len[0]}")
+    #     print(f"  Max new tokens: {script_args.max_new_tokens}")
+    #     print(f"  Decoded input:\n{tokenizer.decode(batch_input_ids[0])}")
+    #     print()
     
-    out = llada.generate_single_cfg(
+    out = llada.generate_two_cfg(
         model,
         tokenizer,
         batch_input_ids,
@@ -123,6 +125,16 @@ for batch_start in range(0, len(input_ids_list), batch_size):
         remasking=script_args.remasking,
         cfg_scale=0.8  # Higher scale to rely more on conditional (question+answer)
     )
+    # out = llada.generate(
+    #     model,
+    #     tokenizer,
+    #     batch_input_ids,        
+    #     steps=script_args.steps,
+    #     max_new_tokens=script_args.max_new_tokens,
+    #     block_length=script_args.block_length,
+    #     temperature=script_args.temperature,
+    #     remasking=script_args.remasking
+    # )
     
     batch_generations = [g.split(tokenizer.eos_token, 1)[0] for g in tokenizer.batch_decode(out)]
     for i, o in enumerate(batch_generations):
@@ -136,17 +148,18 @@ for batch_start in range(0, len(input_ids_list), batch_size):
         print("\n" + "-" * 80)
         print(f"[Case {batch_start + i}]")
         print("-" * 80)
-        print(f"DEBUG: Full output length: {len(o)}")
-        print(f"DEBUG: Extracted generated length: {len(generated_only)}")
-        print(f"DEBUG: Generated before strip length: {len(parts[-1]) if len(parts) > 1 else 0}")
-        print(f"DEBUG: Input shape: {batch_input_ids[i].shape}, Output shape: {out[i].shape}")
+        # print(f"DEBUG: Full output length: {len(o)}")
+        # print(f"DEBUG: Extracted generated length: {len(generated_only)}")
+        # print(f"DEBUG: Generated before strip length: {len(parts[-1]) if len(parts) > 1 else 0}")
+        # print(f"DEBUG: Input shape: {batch_input_ids[i].shape}, Output shape: {out[i].shape}")
         
         # Show first 200 chars of raw generated part
-        if len(parts) > 1:
-            raw_gen = parts[-1]
-            print(f"DEBUG: Raw generated (first 200 chars): {repr(raw_gen[:200])}")
+        # if len(parts) > 1:
+        #     raw_gen = parts[-1]
+        #     print(f"DEBUG: Raw generated (first 200 chars): {repr(raw_gen[:200])}")
         
         print(f"\nGenerated text:\n{generated_only if generated_only else '<empty>'}")
+        print(f"Gold answer: {gold_answer[batch_start + i]}")
     all_generations.extend(batch_generations)
         
     # Clear cache to free memory

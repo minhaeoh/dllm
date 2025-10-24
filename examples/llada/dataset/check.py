@@ -48,5 +48,5 @@ def check_invalid_samples(dataset):
 data = load_from_disk('/home/minhae/diffusion/dllm/examples/llada/dataset/gsm8k_1_0_1')
 # print(data.column_names)
 print(data['train'][0])
-print(len(data['train']))
-print(len(data['test']))
+# print(len(data['train']))
+# print(len(data['test']))

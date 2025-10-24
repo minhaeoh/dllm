@@ -235,7 +235,7 @@ def generate(
 
 
 @torch.no_grad()
-def generate_single_cfg(
+def generate_two_cfg(
     model: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizer,
     prompts: list[torch.Tensor],
