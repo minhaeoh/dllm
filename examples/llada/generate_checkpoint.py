@@ -75,28 +75,6 @@ def custom_apply_chat_template(messages):
     )[0].tolist()
     return {"q_llm_input_ids": q_llm_input_ids, "q_input_ids": q_input_ids, "q_len": len(q_input_ids), "gold_answer": messages[-1]["content"]}
 
-##debug##
-
-# messages = [
-#     {
-#         'role': 'user',
-#         'content': "Question: Daria just got a new credit card so she could buy some furniture. Daria has $500 saved ready to pay for the furniture she buys, but the rest of the money will have to stay on her credit card statement until the next month, when she can pay it off with interest. She bought a couch for $750, a table for $100 and a lamp for $50. After she pays the initial $500, how much does she still owe before interest?"
-#     },
-#     {
-#         'role': 'LLM generated Answer',
-#         'content': "LLM generated Answer: Step 1: The total cost of the furniture is 750+100+50 = $<<750+100+50=900>>900. Step 2: Subtracting the initial payment, Daria still owes $900-500 = $<<900-500=400>>400. The answer is: 400"
-#     },
-#     {
-#         'role': 'assistant',
-#         'content': "Correct Answer: Daria spends $750 + $100 + $50 on furniture = $<<750+100+50=900>>900 total on furniture. Of that $900 she spent, she can pay $500 now, so $900 - $500 = $<<900-500=400>>400 that Daria still owes. The answer is: 400"
-#     }
-# ]
-# formatted_messages = custom_apply_chat_template(messages)
-# print(f"Input text: {tokenizer.decode(formatted_messages['q_llm_input_ids'])}\n")
-# print(f"Input question: {tokenizer.decode(formatted_messages['q_llm_input_ids'][:formatted_messages['q_len']])}\n")
-# print(f"Input question: {tokenizer.decode(formatted_messages['q_input_ids'][:formatted_messages['q_len']])}\n")
-# print(f"Question length: {formatted_messages['q_len']}\n")
-# print(f"Gold answer: {formatted_messages['gold_answer']}\n")
 
 def sft_map_fn(row) -> dict:
     return custom_apply_chat_template(row["messages"])
@@ -114,12 +92,7 @@ with accelerate.PartialState().local_main_process_first():
     q_len = [r["q_len"] for r in results]
     gold_answer = [r["gold_answer"].split("The answer is: ")[1] for r in results]
 
-# import pdb; pdb.set_trace()
-# Debugging: check data is correctly customized
-# print(f"Input text: {tokenizer.decode(input_ids_list[0])}")
-# print(f"Input question: {tokenizer.decode(input_ids_list[0][:q_len[0]])}")
-# print(f"Gold answer: {gold_answer[0]}")
-# print("Question length: ", q_len[0])
+
 
 # --- Example 1: Batch generation ---
 print("\n" + "=" * 80)
