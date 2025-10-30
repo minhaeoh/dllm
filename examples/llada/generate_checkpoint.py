@@ -19,12 +19,13 @@ import accelerate
 import dllm
 from dllm.pipelines import llada
 
-data_name = "gsm8k__1_0_1"
+### config ###
+data_name = "gsm8k_filter_all_1_0_1"
 
 @dataclass
 class ScriptArguments:
     model_name_or_path: str = (
-        "/home/minhae/diffusion/dllm/models/LLaDA-8B-SFT/gsm8k_filter_1_1_1/checkpoint-final"  # "inclusionAI/LLaDA-MoE-7B-A1B-Instruct"
+        "/home/minhae/diffusion/dllm/models/LLaDA-8B-SFT/gsm8k_filter_all_1_0_1/checkpoint-final"  # "inclusionAI/LLaDA-MoE-7B-A1B-Instruct"
         # "GSAI-ML/LLaDA-8B-Instruct"
     )
     steps: int = 128
@@ -48,7 +49,7 @@ data_args = tyro.cli(DataArguments)
 script_args = tyro.cli(ScriptArguments)
 transformers.set_seed(script_args.seed)
 
-# Load model & tokenizer
+# # Load model & tokenizer
 model = dllm.utils.get_model(model_args=script_args).eval()
 tokenizer = dllm.utils.get_tokenizer(model_args=script_args, model=model)
 
@@ -57,6 +58,8 @@ tokenizer = dllm.utils.get_tokenizer(model_args=script_args, model=model)
 def custom_apply_chat_template(messages):
     # Don't move to device in multiprocessing context
     # Return as lists to avoid tensor serialization issues
+    # for i in range(len(messages)):
+    #     print(f"Message {i}: {messages[i]}")
     q_llm_input_ids = tokenizer.apply_chat_template(
         messages[:-1],
         add_generation_prompt=True,
@@ -72,6 +75,29 @@ def custom_apply_chat_template(messages):
     )[0].tolist()
     return {"q_llm_input_ids": q_llm_input_ids, "q_input_ids": q_input_ids, "q_len": len(q_input_ids), "gold_answer": messages[-1]["content"]}
 
+##debug##
+
+# messages = [
+#     {
+#         'role': 'user',
+#         'content': "Question: Daria just got a new credit card so she could buy some furniture. Daria has $500 saved ready to pay for the furniture she buys, but the rest of the money will have to stay on her credit card statement until the next month, when she can pay it off with interest. She bought a couch for $750, a table for $100 and a lamp for $50. After she pays the initial $500, how much does she still owe before interest?"
+#     },
+#     {
+#         'role': 'LLM generated Answer',
+#         'content': "LLM generated Answer: Step 1: The total cost of the furniture is 750+100+50 = $<<750+100+50=900>>900. Step 2: Subtracting the initial payment, Daria still owes $900-500 = $<<900-500=400>>400. The answer is: 400"
+#     },
+#     {
+#         'role': 'assistant',
+#         'content': "Correct Answer: Daria spends $750 + $100 + $50 on furniture = $<<750+100+50=900>>900 total on furniture. Of that $900 she spent, she can pay $500 now, so $900 - $500 = $<<900-500=400>>400 that Daria still owes. The answer is: 400"
+#     }
+# ]
+# formatted_messages = custom_apply_chat_template(messages)
+# print(f"Input text: {tokenizer.decode(formatted_messages['q_llm_input_ids'])}\n")
+# print(f"Input question: {tokenizer.decode(formatted_messages['q_llm_input_ids'][:formatted_messages['q_len']])}\n")
+# print(f"Input question: {tokenizer.decode(formatted_messages['q_input_ids'][:formatted_messages['q_len']])}\n")
+# print(f"Question length: {formatted_messages['q_len']}\n")
+# print(f"Gold answer: {formatted_messages['gold_answer']}\n")
+
 def sft_map_fn(row) -> dict:
     return custom_apply_chat_template(row["messages"])
 
@@ -83,10 +109,17 @@ with accelerate.PartialState().local_main_process_first():
     print("filtered test dataset length: ", len(dataset))
     results = dataset.map(sft_map_fn, num_proc=data_args.num_proc, remove_columns=dataset.column_names)
     # Move to device after multiprocessing is done
-    # input_ids_list = [torch.tensor(r["q_llm_input_ids"]).to(model.device) for r in results]
-    input_ids_list = [torch.tensor(r["q_input_ids"]).to(model.device) for r in results]
+    input_ids_list = [torch.tensor(r["q_llm_input_ids"]).to(model.device) for r in results]
+    # input_ids_list = [torch.tensor(r["q_input_ids"]).to(model.device) for r in results]
     q_len = [r["q_len"] for r in results]
     gold_answer = [r["gold_answer"].split("The answer is: ")[1] for r in results]
+
+# import pdb; pdb.set_trace()
+# Debugging: check data is correctly customized
+# print(f"Input text: {tokenizer.decode(input_ids_list[0])}")
+# print(f"Input question: {tokenizer.decode(input_ids_list[0][:q_len[0]])}")
+# print(f"Gold answer: {gold_answer[0]}")
+# print("Question length: ", q_len[0])
 
 # --- Example 1: Batch generation ---
 print("\n" + "=" * 80)
@@ -104,14 +137,6 @@ for batch_start in range(0, len(input_ids_list), batch_size):
     batch_input_ids = input_ids_list[batch_start:batch_end]
     batch_q_len = q_len[batch_start:batch_end]
     
-    # Debug: print first sample info
-    # if batch_start == 0:
-    #     print(f"\nDEBUG: First sample")
-    #     print(f"  Input length: {len(batch_input_ids[0])}")
-    #     print(f"  Question length: {batch_q_len[0]}")
-    #     print(f"  Max new tokens: {script_args.max_new_tokens}")
-    #     print(f"  Decoded input:\n{tokenizer.decode(batch_input_ids[0])}")
-    #     print()
     
     out = llada.generate_two_cfg(
         model,
@@ -123,7 +148,7 @@ for batch_start in range(0, len(input_ids_list), batch_size):
         block_length=script_args.block_length,
         temperature=script_args.temperature,
         remasking=script_args.remasking,
-        cfg_scale=0.8  # Higher scale to rely more on conditional (question+answer)
+        cfg_scale=0  # Higher scale to rely more on condition 1 (question+llm)
     )
     # out = llada.generate(
     #     model,
@@ -136,43 +161,27 @@ for batch_start in range(0, len(input_ids_list), batch_size):
     #     remasking=script_args.remasking
     # )
     
-    batch_generations = [g.split(tokenizer.eos_token, 1)[0] for g in tokenizer.batch_decode(out)]
-    for i, o in enumerate(batch_generations):
+    
+    for i, o in enumerate(out):
         # Extract only the generated part (after the last assistant header)
-        parts = o.split("<|start_header_id|>assistant<|end_header_id|>")
-        if len(parts) > 1:
-            generated_only = parts[-1].strip()  # Get the last part after assistant header
-        else:
-            generated_only = o.strip()
-        
-        print("\n" + "-" * 80)
-        print(f"[Case {batch_start + i}]")
-        print("-" * 80)
-        # print(f"DEBUG: Full output length: {len(o)}")
-        # print(f"DEBUG: Extracted generated length: {len(generated_only)}")
-        # print(f"DEBUG: Generated before strip length: {len(parts[-1]) if len(parts) > 1 else 0}")
-        # print(f"DEBUG: Input shape: {batch_input_ids[i].shape}, Output shape: {out[i].shape}")
-        
-        # Show first 200 chars of raw generated part
-        # if len(parts) > 1:
-        #     raw_gen = parts[-1]
-        #     print(f"DEBUG: Raw generated (first 200 chars): {repr(raw_gen[:200])}")
-        
-        print(f"\nGenerated text:\n{generated_only if generated_only else '<empty>'}")
-        print(f"Gold answer: {gold_answer[batch_start + i]}")
-    all_generations.extend(batch_generations)
+        start_index = len(batch_input_ids[i])
+        stop_index = start_index + script_args.max_new_tokens
+        generated_only = o[start_index:stop_index]
+        total_input = tokenizer.decode(batch_input_ids[i])
+        question = tokenizer.decode(batch_input_ids[i][:batch_q_len[i]])
+        generated_text = tokenizer.decode(generated_only)
+        print(f"Total input: {total_input}\n")
+        print(f"Input question: {question}\n")
+        print(f"Generated text: {generated_text}\n")
+        print(f"Gold answer: {gold_answer[batch_start + i]}\n")
+        print("\n" + "=" * 80)
         
     # Clear cache to free memory
     torch.cuda.empty_cache()
     break
 
-# Print first few results
-# for i, o in enumerate(all_generations[:5]):
-#     print("\n" + "-" * 80)
-#     print(f"[Case {i}]")
-#     print("-" * 80)
-#     print(o.strip() if o.strip() else "<empty>")
 
-print(f"\nTotal generated: {len(all_generations)} samples")
-print("\n" + "=" * 80 + "\n")
+
+# print(f"\nTotal generated: {len(all_generations)} samples")
+# print("\n" + "=" * 80 + "\n")
 
