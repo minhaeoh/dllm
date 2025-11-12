@@ -12,7 +12,7 @@ def get_gsm8k_dataset():
   print(f"Raw data loaded: {len(raw_data)} samples")
 
   # Use select instead of slicing to avoid string conversion
-  train_size = int(len(raw_data) * 0.8)
+  train_size = int(len(raw_data) * 0.9)
 
   splits = {
     'train': raw_data.select(range(train_size)),
@@ -41,15 +41,21 @@ def get_gsm8k_dataset():
   
   def format_data_q_llm_cond(d):
     question = 'Question: ' + d['question']
-    llm_answer_text = d['llm_answer'] if isinstance(d['llm_answer'], str) else random.choice(d['llm_answer'])
-    llm_answer = ' LLM generated Answer: ' + llm_answer_text
     answer = ' Correct Answer: ' + d['gold_solution']+'The answer is: ' + d['gold_answer']
+
+    llm_answers = [d['llm_answer']] if isinstance(d['llm_answer'], str) else d['llm_answer']
     
-    messages = []
-    messages.append({"role": "user", "content": question})
-    messages.append({"role": "LLM generated Answer", "content": llm_answer})
-    messages.append({"role": "assistant", "content": answer})
-    return messages, d["index"]
+    # 각 LLM 답변에 대해 별도의 메시지 리스트 생성
+    all_messages = []
+    for llm_answer_text in llm_answers:
+        messages = []
+        messages.append({"role": "user", "content": question})
+        messages.append({"role": "LLM generated Answer", "content": ' LLM generated Answer: ' + llm_answer_text})
+        messages.append({"role": "assistant", "content": answer})
+        all_messages.append((messages, d["index"]))
+    
+    return all_messages
+    
 
 
   # Process splits
@@ -63,18 +69,19 @@ def get_gsm8k_dataset():
       
       # Try each tokenization method and filter out None values
       try:
-        if i %2 == 0:
-          formatted_q, index = format_data_q_cond(d)
-          if formatted_q is not None:
-            processed_data.append({"id":index,"messages": formatted_q,"source":"gsm8k_q_cond"})
+        # if i %2 == 0:
+        formatted_q, index = format_data_q_cond(d)
+        if formatted_q is not None:
+          processed_data.append({"id":index,"messages": formatted_q,"source":"q_cond"})
         # elif i %3 == 1:
         #   formatted_llm, index = format_data_llm_cond(d)
         #   if formatted_llm is not None:
         #     processed_data.append({"id":index,"messages": formatted_llm,"source":"gsm8k_llm_cond"})
-        elif i %2 == 1:
-          formatted_q_llm, index = format_data_q_llm_cond(d)
-          if formatted_q_llm is not None:
-            processed_data.append({"id":index,"messages": formatted_q_llm,"source":"gsm8k_q_llm_cond"})
+        # elif i %2 == 1:
+        formatted_q_llms = format_data_q_llm_cond(d)
+        for messages, index in formatted_q_llms:
+                if messages is not None:
+                    processed_data.append({"id":index, "messages": messages, "source":"q_llm_cond"})
       except Exception as e:
         print(f"Error processing sample {i}: {e}")
         print(f"Sample keys: {list(d.keys()) if hasattr(d, 'keys') else 'No keys'}")
@@ -94,7 +101,7 @@ def get_gsm8k_dataset():
 dataset_dict = get_gsm8k_dataset()
 
 # Save as DatasetDict
-dataset_dict.save_to_disk("/home/minhae/diffusion/dllm/examples/llada/dataset/gsm8k_filter_unique_1_0_1")
+dataset_dict.save_to_disk("/home/minhae/diffusion/dllm/examples/llada/dataset/gsm8k_filter_all_1_0_1")
 
 
 

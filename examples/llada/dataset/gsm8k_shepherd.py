@@ -210,7 +210,7 @@ def build_math_main_index(math_train, math_test, math_scorer):
     """hendrycks/competition_math의 train+test에서 (q -> gold) 인덱스 구축"""
     def _one_split(ds):
         q2a, qs = {}, []
-        for ex in ds:
+        for i, ex in enumerate(ds):
             q = _normalize_text(ex.get("problem", ""))
             sol = ex.get("solution", "")
             try:
@@ -219,15 +219,19 @@ def build_math_main_index(math_train, math_test, math_scorer):
                 a = None
             if q and a is not None:
                 a = _normalize_text(str(a))
-                q2a[q] = a
+                q2a[q] = = {
+                    "index": i,
+                    "gold_answer": a,
+                    "solution": sol
+                }
                 qs.append(q)
         return q2a, qs
 
-    q2a_tr, qs_tr = _one_split(math_train)
-    q2a_te, qs_te = _one_split(math_test)
-    q2a = {**q2a_tr, **q2a_te}
-    qs   = qs_tr + qs_te
-    return q2a, qs
+    # q2a_tr, qs_tr = _one_split(math_train)
+    # q2a_te, qs_te = _one_split(math_test)
+    # q2a = {**q2a_tr, **q2a_te}
+    # qs   = qs_tr + qs_te
+    # return q2a, qs
 
 # Matching
 def _best_fuzzy_rf(query: str, candidates: List[str], cutoff: int = 95) -> Optional[str]:
@@ -243,7 +247,7 @@ def _best_fuzzy_rf(query: str, candidates: List[str], cutoff: int = 95) -> Optio
 # Main: attach gold_answer with fail indices
 def attach_gold_answers_by_task_rf(ms_ds: Dataset, gsm_index: Tuple[Dict[str, str], List[str]], fuzzy_cutoff: int = 95, num_proc: int = os.cpu_count(),) -> Tuple[Dataset, List[int]]:
     gsm_q2a, gsm_qs = gsm_index
-    # mmain_q2a, mmain_qs   = math_main_index
+    mmain_q2a, mmain_qs   = math_main_index
     # m5_q2a, m5_qs         = math500_index
 
     # mapper는 프로세스 간 공유상태 사용 금지 → 실패 여부는 컬럼으로 반환
@@ -268,6 +272,19 @@ def attach_gold_answers_by_task_rf(ms_ds: Dataset, gsm_index: Tuple[Dict[str, st
                         data = gsm_q2a[hit]
                         gsm8k_q = hit
                         gold, solution, src, mtype, index = data["gold_answer"], data["solution"], "gsm8k", "fuzzy", data["index"]
+                        llm_answer = sol
+            elif t == "math":
+                if q in mmain_q2a:
+                    data = mmain_q2a[q]
+                    mmain_q = q
+                    gold, solution, src, mtype, index = data["gold_answer"], data["solution"], "math", "exact", data["index"]
+                    llm_answer = sol
+                else:
+                    hit = _best_fuzzy_rf(q, mmain_qs, cutoff=fuzzy_cutoff)
+                    if hit:
+                        data = mmain_q2a[hit]
+                        mmain_q = hit
+                        gold, solution, src, mtype, index = data["gold_answer"], data["solution"], "math", "fuzzy", data["index"]
                         llm_answer = sol
 
             elif t != "gsm8k" and t != "math":
@@ -346,10 +363,10 @@ def main():
     # 1) 소스 인덱스 준비 (GSM8K, MATH main mirror, MATH-500)
     gsm_train = load_dataset("openai/gsm8k", "main")["train"]
     gsm_index = build_gsm8k_index(gsm_train)
-    # math_main  = load_dataset("HuggingFaceTB/MATH", "all")
-    # math_train = math_main["train"]
-    # math_test  = math_main["test"]
-    # math_main_idx  = build_math_main_index(math_train, math_test, MATHScorer)
+    math_main  = load_dataset("HuggingFaceTB/MATH", "all")
+    math_train = math_main["train"]
+    math_test  = math_main["test"]
+    math_main_idx  = build_math_main_index(math_train, math_test, MATHScorer)
     # math500 = load_dataset("HuggingFaceH4/MATH-500")["test"]
     # math500_index = build_math500_index(math500)
 
@@ -357,7 +374,7 @@ def main():
     ms_with_gold, fail_ids = attach_gold_answers_by_task_rf(
         ms_all,
         gsm_index=gsm_index,
-        # math_main_index=math_main_idx,
+        math_main_index=math_main_idx,
         # math500_index=math500_index,
         fuzzy_cutoff=95,
         num_proc=16
@@ -389,7 +406,7 @@ def main():
 
     # 5) 통계 출력 및 저장
     _ = analyze_value_distribution(ms_gold_only)
-    out_dir = "/home/minhae/diffusion/dllm/examples/llada/dataset/gsm8k_match_index_llm_answer2"
+    out_dir = "/home/minhae/diffusion/dllm/examples/llada/dataset/before/math_gsm8k_match_data"
     os.makedirs(out_dir, exist_ok=True)
     ms_gold_only.save_to_disk(out_dir)
     print("[DONE] Final dataset:", len(ms_gold_only))

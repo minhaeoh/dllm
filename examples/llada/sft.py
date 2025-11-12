@@ -35,7 +35,8 @@ import accelerate
 import dllm
 from dllm.pipelines import llada
 
-data_name = "gsm8k_filter_unique_1_0_1"
+data_name = "gsm8k_filter_1_0_1"
+max_length = 2056
 
 @dataclass
 class ModelArguments(dllm.utils.ModelArguments):
@@ -48,11 +49,13 @@ class ModelArguments(dllm.utils.ModelArguments):
 class DataArguments(dllm.utils.DataArguments):
     # dataset_args: str = "allenai/tulu-3-sft-mixture[train:10000,test:1000]" 
     dataset_args: str = data_name # Use our local GSM8K dataset
+    max_length: int = max_length
+    truncation: str = "right"  # "right" when using prompt
 
 
 @dataclass
 class TrainingArguments(dllm.utils.TrainingArguments):
-    output_dir: str = "models/LLaDA-8B-SFT/" + data_name
+    output_dir: str = "models/LLaDA-8B-SFT/" + data_name + "_ml"+str(max_length)
     # Enable LoRA for efficient fine-tuning
     lora: bool = field(
         default=True,
