@@ -235,7 +235,7 @@ def generate(
 
 
 @torch.no_grad()
-def generate_two_cfg_dynamic(
+def generate_two_condition_dynamic(
     model: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizer,
     prompts: list[torch.Tensor],
@@ -429,227 +429,9 @@ def generate_two_cfg_dynamic(
         }
 
 
-@torch.no_grad()    
-def generate_three_cfg_dynamic(
-    model: transformers.PreTrainedModel,
-    tokenizer: transformers.PreTrainedTokenizer,
-    prompts: list[torch.Tensor],
-    q_len: list[int],
-    scheduler: BaseAlphaScheduler = LinearAlphaScheduler(),
-    steps: int = 128,
-    max_new_tokens: int = 256,
-    max_length: int = 1024,
-    block_length: int = 128,
-    temperature: float = 0.0,
-    cfg_keep_tokens: list = None,
-    remasking: str = "random",
-    return_dict_in_generate: bool = False,
-    stochastic_transfer: bool = False,
-) -> torch.Tensor | dict:
-    """
-    Blockwise diffusion-style masked decoding with 3-condition dynamic CFG.
-
-    Three conditions:
-      - uncond: empty prompt (no context)
-      - cond2: question only
-      - cond1: question + llm_answer
-
-    Dynamic blending:
-      - Compute per-position confidences (max softmax prob) c1, c2, c3
-      - Normalize to weights w1, w2, w3 with softmax-like normalization
-      - Combine generation-region logits as:
-          cfg_gen_logits = w1 * cond1 + w2 * cond2 + w3 * uncond
-
-    Args:
-        prompts (list[torch.Tensor]): Full prompts (question + llm_answer) per sample.
-        q_len (list[int]): Length of question-only part per sample.
-        Other args similar to generate().
-    """
-    assert 1 <= block_length <= max_new_tokens
-    assert 1 <= steps
-
-    mask_id = tokenizer.mask_token_id
-    eos_id = tokenizer.eos_token_id
-
-    B = len(prompts)
-
-    # ----- Setup cond1 (question + llm_answer) canvas -----
-    cond1_prompt_lens = [p.shape[0] for p in prompts]
-    T_cond1 = max(cond1_prompt_lens) + max_new_tokens
-
-    x_cond1 = torch.full((B, T_cond1), eos_id, dtype=torch.long, device=model.device)
-    for i, p in enumerate(prompts):
-        x_cond1[i, :cond1_prompt_lens[i]] = p
-        x_cond1[i, cond1_prompt_lens[i]:cond1_prompt_lens[i] + max_new_tokens] = mask_id
-
-    # ----- Setup cond2 (question only) canvas -----
-    cond2_prompt_lens = q_len
-    T_cond2 = max(cond2_prompt_lens) + max_new_tokens
-
-    x_cond2 = torch.full((B, T_cond2), eos_id, dtype=torch.long, device=model.device)
-    for i in range(B):
-        x_cond2[i, :cond2_prompt_lens[i]] = prompts[i][:cond2_prompt_lens[i]]
-        x_cond2[i, cond2_prompt_lens[i]:cond2_prompt_lens[i] + max_new_tokens] = mask_id
-
-    # ----- Setup uncond (empty prompt) canvas -----
-    uncond_prompt_lens = [0] * B  # no prompt
-    T_uncond = max_new_tokens
-
-    x_uncond = torch.full((B, T_uncond), eos_id, dtype=torch.long, device=model.device)
-    for i in range(B):
-        x_uncond[i, :max_new_tokens] = mask_id
-
-    # ----- Block scheduling -----
-    num_blocks = math.ceil(max_new_tokens / block_length)
-    steps_per_block = math.ceil(steps / num_blocks)
-    effective_steps_per_block: list[int] = []
-
-    for b in range(num_blocks):
-        # Build block mask for conditional (they share the same generation region)
-        block_mask_index = torch.zeros((B, block_length), dtype=torch.bool, device=x_cond1.device)
-        
-        for j in range(B):
-            start = cond1_prompt_lens[j] + b * block_length
-            end = min(start + block_length, cond1_prompt_lens[j] + max_new_tokens, T_cond1)
-            if start < end:
-                width = end - start
-                block_mask_index[j, :width] = (x_cond1[j, start:end] == mask_id)
-
-        num_transfer_tokens = get_num_transfer_tokens(
-            mask_index=block_mask_index,
-            steps=steps_per_block,
-            scheduler=scheduler,
-            stochastic=stochastic_transfer,
-        )
-
-        effective_steps = num_transfer_tokens.size(1)
-        effective_steps_per_block.append(effective_steps)
-
-        # ----- Iterative reveal -----
-        for step_i in range(effective_steps):
-            # Forward pass for all three conditions
-            cond1_logits = model(x_cond1).logits  # [B, T_cond1, V]
-            cond2_logits = model(x_cond2).logits  # [B, T_cond2, V]
-            uncond_logits = model(x_uncond).logits  # [B, T_uncond, V]
-
-            # Extract generation region logits (all have same max_new_tokens)
-            cond1_gen_logits = torch.stack([
-                cond1_logits[j, cond1_prompt_lens[j]:cond1_prompt_lens[j] + max_new_tokens]
-                for j in range(B)
-            ], dim=0)  # [B, max_new_tokens, V]
-
-            cond2_gen_logits = torch.stack([
-                cond2_logits[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens]
-                for j in range(B)
-            ], dim=0)  # [B, max_new_tokens, V]
-
-            uncond_gen_logits = uncond_logits[:, :max_new_tokens, :]  # [B, max_new_tokens, V]
-
-            # Dynamic per-position confidences
-            p1 = torch.softmax(cond1_gen_logits, dim=-1)
-            p2 = torch.softmax(cond2_gen_logits, dim=-1)
-            p3 = torch.softmax(uncond_gen_logits, dim=-1)
-            c1, _ = p1.max(dim=-1)  # [B, Tgen]
-            c2, _ = p2.max(dim=-1)
-            c3, _ = p3.max(dim=-1)
-
-            denom = (c1 + c2 + c3 + 1e-8).unsqueeze(-1)  # [B, Tgen, 1]
-            w1 = (c1 / (c1 + c2 + c3 + 1e-8)).unsqueeze(-1)
-            w2 = (c2 / (c1 + c2 + c3 + 1e-8)).unsqueeze(-1)
-            w3 = (c3 / (c1 + c2 + c3 + 1e-8)).unsqueeze(-1)
-
-            # Combine generation-region logits with dynamic weights
-            cfg_gen_logits = w1 * cond1_gen_logits + w2 * cond2_gen_logits + w3 * uncond_gen_logits
-
-            # Reconstruct full logits for all canvases
-            cond1_final_logits = cond1_logits.clone()
-            for j in range(B):
-                cond1_final_logits[j, cond1_prompt_lens[j]:cond1_prompt_lens[j] + max_new_tokens] = cfg_gen_logits[j]
-
-            cond2_final_logits = cond2_logits.clone()
-            for j in range(B):
-                cond2_final_logits[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens] = cfg_gen_logits[j]
-
-            uncond_final_logits = uncond_logits.clone()
-            uncond_final_logits[:, :max_new_tokens, :] = cfg_gen_logits
-
-            # Argmax decoding with optional Gumbel noise on combined logits
-            cond1_logits_with_noise = add_gumbel_noise(cond1_final_logits, temperature=temperature)
-            x0_cond1 = torch.argmax(cond1_logits_with_noise, dim=-1)  # [B, T_cond1]
-
-            cond2_logits_with_noise = add_gumbel_noise(cond2_final_logits, temperature=temperature)
-            x0_cond2 = torch.argmax(cond2_logits_with_noise, dim=-1)  # [B, T_cond2]
-
-            uncond_logits_with_noise = add_gumbel_noise(uncond_final_logits, temperature=temperature)
-            x0_uncond = torch.argmax(uncond_logits_with_noise, dim=-1)  # [B, T_uncond]
-
-            # Compute confidence for remasking (based on combined logits)
-            if remasking == "low_confidence":
-                p = F.softmax(cond1_final_logits, dim=-1)
-                x0_p = torch.gather(p, dim=-1, index=x0_cond1.unsqueeze(-1)).squeeze(-1)
-            elif remasking == "random":
-                x0_p = torch.rand_like(x0_cond1, dtype=torch.float32)
-            else:
-                raise NotImplementedError(remasking)
-
-            # Restrict to current block
-            mask_index_cond1 = x_cond1 == mask_id
-            for j in range(B):
-                x0_p[j, cond1_prompt_lens[j] + (b + 1) * block_length:] = -np.inf
-
-            # Only update masked positions
-            x0_cond1 = torch.where(mask_index_cond1, x0_cond1, x_cond1)
-            confidence = torch.where(mask_index_cond1, x0_p, -np.inf)
-
-            # Select top-k positions to commit
-            transfer_index_cond1 = torch.zeros_like(x0_cond1, dtype=torch.bool)
-            for j in range(B):
-                k = int(num_transfer_tokens[j, step_i].item())
-                if k > 0:
-                    _, select_index = torch.topk(confidence[j], k=k)
-                    transfer_index_cond1[j, select_index] = True
-
-            # Commit predictions to cond1 canvas
-            x_cond1[transfer_index_cond1] = x0_cond1[transfer_index_cond1]
-
-            # Sync cond2 and uncond canvases with same tokens
-            for j in range(B):
-                cond1_gen_start = cond1_prompt_lens[j]
-                cond2_gen_start = cond2_prompt_lens[j]
-                uncond_gen_start = 0
-
-                gen_transfer_mask = transfer_index_cond1[j, cond1_gen_start:cond1_gen_start + max_new_tokens]
-
-                if gen_transfer_mask.any():
-                    cfg_predicted_tokens = x0_cond1[j, cond1_gen_start:cond1_gen_start + max_new_tokens][gen_transfer_mask]
-
-                    # Update cond2
-                    cond2_gen_positions = torch.arange(
-                        cond2_gen_start,
-                        cond2_gen_start + max_new_tokens,
-                        device=x_cond2.device
-                    )[gen_transfer_mask]
-                    x_cond2[j, cond2_gen_positions] = cfg_predicted_tokens
-
-                    # Update uncond
-                    uncond_gen_positions = torch.arange(
-                        uncond_gen_start,
-                        uncond_gen_start + max_new_tokens,
-                        device=x_uncond.device
-                    )[gen_transfer_mask]
-                    x_uncond[j, uncond_gen_positions] = cfg_predicted_tokens
-
-    if not return_dict_in_generate:
-        return x_cond1
-    else:
-        return {
-            "effective_steps_per_block": effective_steps_per_block,
-            "sequences": x_cond1,
-        }
-
 
 @torch.no_grad()
-def generate_two_cfg(
+def generate_two_condition(
     model: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizer,
     prompts: list[torch.Tensor],
@@ -836,7 +618,7 @@ def generate_two_cfg(
         }
 
 @torch.no_grad()
-def generate_three_cfg(
+def generate_two_cfg(
     model: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizer,
     prompts: list[torch.Tensor],
@@ -859,19 +641,19 @@ def generate_three_cfg(
 
     Three conditions:
       - uncond: empty prompt (no context)
-      - cond2: question only
-      - cond1: question + llm_answer
+      - cond1: question only
+      - cond2: question + llm_answer
     
     CFG formula:
-      cfg_gen_logits = uncond + cfg_scale1 * (cond2 - uncond) + cfg_scale2 * (cond1 - cond2)
+      cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - cond1)
 
     Args:
         prompts (list[torch.Tensor]):
             Full prompts (question + llm_answer) for each sample.
         q_len (list[int]):
             Length of question-only part for each sample.
-        cfg_scale1 (float): Weight for (cond2 - uncond) guidance.
-        cfg_scale2 (float): Weight for (cond1 - cond2) guidance.
+        cfg_scale1 (float): Weight for (cond1 - uncond) guidance.
+        cfg_scale2 (float): Weight for (cond2 - cond1) guidance.
         Other args similar to generate().
     """
     assert 1 <= block_length <= max_new_tokens
@@ -882,22 +664,22 @@ def generate_three_cfg(
 
     B = len(prompts)
     
-    # ----- Setup cond1 (question + llm_answer) canvas -----
-    cond1_prompt_lens = [p.shape[0] for p in prompts]
+    # ----- Setup cond1 (question only) canvas -----
+    cond1_prompt_lens = q_len
     T_cond1 = max(cond1_prompt_lens) + max_new_tokens
     
     x_cond1 = torch.full((B, T_cond1), eos_id, dtype=torch.long, device=model.device)
-    for i, p in enumerate(prompts):
-        x_cond1[i, :cond1_prompt_lens[i]] = p
+    for i in range(B):
+        x_cond1[i, :cond1_prompt_lens[i]] = prompts[i][:cond1_prompt_lens[i]]
         x_cond1[i, cond1_prompt_lens[i]:cond1_prompt_lens[i] + max_new_tokens] = mask_id
     
-    # ----- Setup cond2 (question only) canvas -----
-    cond2_prompt_lens = q_len
+    # ----- Setup cond2 (question + llm_answer) canvas -----
+    cond2_prompt_lens = [p.shape[0] for p in prompts]
     T_cond2 = max(cond2_prompt_lens) + max_new_tokens
     
     x_cond2 = torch.full((B, T_cond2), eos_id, dtype=torch.long, device=model.device)
-    for i in range(B):
-        x_cond2[i, :cond2_prompt_lens[i]] = prompts[i][:cond2_prompt_lens[i]]
+    for i, p in enumerate(prompts):
+        x_cond2[i, :cond2_prompt_lens[i]] = p
         x_cond2[i, cond2_prompt_lens[i]:cond2_prompt_lens[i] + max_new_tokens] = mask_id
     
     # ----- Setup uncond (empty prompt) canvas -----
@@ -915,14 +697,14 @@ def generate_three_cfg(
 
     for b in range(num_blocks):
         # Build block mask for conditional (they share the same generation region)
-        block_mask_index = torch.zeros((B, block_length), dtype=torch.bool, device=x_cond1.device)
+        block_mask_index = torch.zeros((B, block_length), dtype=torch.bool, device=x_cond2.device)
         
         for j in range(B):
-            start = cond1_prompt_lens[j] + b * block_length
-            end = min(start + block_length, cond1_prompt_lens[j] + max_new_tokens, T_cond1)
+            start = cond2_prompt_lens[j] + b * block_length
+            end = min(start + block_length, cond2_prompt_lens[j] + max_new_tokens, T_cond2)
             if start < end:
                 width = end - start
-                block_mask_index[j, :width] = (x_cond1[j, start:end] == mask_id)
+                block_mask_index[j, :width] = (x_cond2[j, start:end] == mask_id)
 
         num_transfer_tokens = get_num_transfer_tokens(
             mask_index=block_mask_index,
@@ -955,11 +737,11 @@ def generate_three_cfg(
             uncond_gen_logits = uncond_logits[:, :max_new_tokens, :]  # [B, max_new_tokens, V]
             
             # Apply 3-condition CFG on generation region
-            # cfg_gen_logits = uncond + cfg_scale1 * (cond2 - uncond) + cfg_scale2 * (cond1 - cond2)
+            # cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - cond1)
             cfg_gen_logits = (
                 uncond_gen_logits 
-                + (1+cfg_scale1) * (cond2_gen_logits - uncond_gen_logits)
-                + (1+cfg_scale2) * (cond1_gen_logits - cond2_gen_logits)
+                + (1+cfg_scale1) * (cond1_gen_logits - uncond_gen_logits)
+                + (1+cfg_scale2) * (cond2_gen_logits - cond1_gen_logits)
             )
             # Reconstruct full logits for all canvases
             cond1_final_logits = cond1_logits.clone()   
@@ -983,53 +765,53 @@ def generate_three_cfg(
             uncond_logits_with_noise = add_gumbel_noise(uncond_final_logits, temperature=temperature)
             x0_uncond = torch.argmax(uncond_logits_with_noise, dim=-1)  # [B, T_uncond]
 
-            # Compute confidence for remasking (based on CFG logits)
+            # Compute confidence for remasking (based on CFG logits, use cond2 as reference)
             if remasking == "low_confidence":
-                p = F.softmax(cond1_final_logits, dim=-1)
-                x0_p = torch.gather(p, dim=-1, index=x0_cond1.unsqueeze(-1)).squeeze(-1)
+                p = F.softmax(cond2_final_logits, dim=-1)
+                x0_p = torch.gather(p, dim=-1, index=x0_cond2.unsqueeze(-1)).squeeze(-1)
             elif remasking == "random":
-                x0_p = torch.rand_like(x0_cond1, dtype=torch.float32)
+                x0_p = torch.rand_like(x0_cond2, dtype=torch.float32)
             else:
                 raise NotImplementedError(remasking)
 
             # Restrict to current block
-            mask_index_cond1 = x_cond1 == mask_id
+            mask_index_cond2 = x_cond2 == mask_id
             for j in range(B):
-                x0_p[j, cond1_prompt_lens[j] + (b + 1) * block_length:] = -np.inf
+                x0_p[j, cond2_prompt_lens[j] + (b + 1) * block_length:] = -np.inf
 
             # Only update masked positions
-            x0_cond1 = torch.where(mask_index_cond1, x0_cond1, x_cond1)
-            confidence = torch.where(mask_index_cond1, x0_p, -np.inf)
+            x0_cond2 = torch.where(mask_index_cond2, x0_cond2, x_cond2)
+            confidence = torch.where(mask_index_cond2, x0_p, -np.inf)
 
             # Select top-k positions to commit
-            transfer_index_cond1 = torch.zeros_like(x0_cond1, dtype=torch.bool)
+            transfer_index_cond2 = torch.zeros_like(x0_cond2, dtype=torch.bool)
             for j in range(B):
                 k = int(num_transfer_tokens[j, step_i].item())
                 if k > 0:
                     _, select_index = torch.topk(confidence[j], k=k)
-                    transfer_index_cond1[j, select_index] = True
+                    transfer_index_cond2[j, select_index] = True
 
-            # Commit CFG predictions to cond1 canvas
-            x_cond1[transfer_index_cond1] = x0_cond1[transfer_index_cond1]
+            # Commit CFG predictions to cond2 canvas (question + llm_answer)
+            x_cond2[transfer_index_cond2] = x0_cond2[transfer_index_cond2]
             
-            # Sync cond2 and uncond canvases with same tokens
+            # Sync cond1 and uncond canvases with same tokens
             for j in range(B):
                 cond1_gen_start = cond1_prompt_lens[j]
                 cond2_gen_start = cond2_prompt_lens[j]
                 uncond_gen_start = 0
                 
-                gen_transfer_mask = transfer_index_cond1[j, cond1_gen_start:cond1_gen_start + max_new_tokens]
+                gen_transfer_mask = transfer_index_cond2[j, cond2_gen_start:cond2_gen_start + max_new_tokens]
                 
                 if gen_transfer_mask.any():
-                    cfg_predicted_tokens = x0_cond1[j, cond1_gen_start:cond1_gen_start + max_new_tokens][gen_transfer_mask]
+                    cfg_predicted_tokens = x0_cond2[j, cond2_gen_start:cond2_gen_start + max_new_tokens][gen_transfer_mask]
                     
-                    # Update cond2
-                    cond2_gen_positions = torch.arange(
-                        cond2_gen_start, 
-                        cond2_gen_start + max_new_tokens, 
-                        device=x_cond2.device
+                    # Update cond1
+                    cond1_gen_positions = torch.arange(
+                        cond1_gen_start, 
+                        cond1_gen_start + max_new_tokens, 
+                        device=x_cond1.device
                     )[gen_transfer_mask]
-                    x_cond2[j, cond2_gen_positions] = cfg_predicted_tokens
+                    x_cond1[j, cond1_gen_positions] = cfg_predicted_tokens
                     
                     # Update uncond
                     uncond_gen_positions = torch.arange(
@@ -1040,13 +822,241 @@ def generate_three_cfg(
                     x_uncond[j, uncond_gen_positions] = cfg_predicted_tokens
 
     if not return_dict_in_generate:
-        return x_cond1
+        return x_cond2
     else:
         return {
             "effective_steps_per_block": effective_steps_per_block,
-            "sequences": x_cond1,
+            "sequences": x_cond2,
         }
     
+
+@torch.no_grad()
+def generate_two_cfg_adaptive(
+    model: transformers.PreTrainedModel,
+    tokenizer: transformers.PreTrainedTokenizer,
+    prompts: list[torch.Tensor],
+    q_len: list[int],
+    scheduler: BaseAlphaScheduler = LinearAlphaScheduler(),
+    steps: int = 128,
+    max_new_tokens: int = 256,
+    max_length: int = 1024,
+    block_length: int = 128,
+    temperature: float = 0.0,
+    cfg_scale1: float | None = None,
+    cfg_scale2: float | None = None,
+    cfg_keep_tokens: list = None,
+    remasking: str = "random",
+    return_dict_in_generate: bool = False,
+    stochastic_transfer: bool = False,
+) -> torch.Tensor | dict:
+    """
+    Blockwise diffusion-style masked decoding with 3-condition CFG.
+
+    Three conditions:
+      - uncond: empty prompt (no context)
+      - cond1: question only
+      - cond2: question + llm_answer
+    
+    CFG formula:
+      cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - cond1)
+
+    Args:
+        prompts (list[torch.Tensor]):
+            Full prompts (question + llm_answer) for each sample.
+        q_len (list[int]):
+            Length of question-only part for each sample.
+        cfg_scale1 (float): Weight for (cond1 - uncond) guidance.
+        cfg_scale2 (float): Weight for (cond2 - cond1) guidance.
+        Other args similar to generate().
+    """
+    assert 1 <= block_length <= max_new_tokens
+    assert 1 <= steps
+
+    mask_id = tokenizer.mask_token_id
+    eos_id = tokenizer.eos_token_id
+
+    B = len(prompts)
+    
+    # ----- Setup cond1 (question only) canvas -----
+    cond1_prompt_lens = q_len
+    T_cond1 = max(cond1_prompt_lens) + max_new_tokens
+    
+    x_cond1 = torch.full((B, T_cond1), eos_id, dtype=torch.long, device=model.device)
+    for i in range(B):
+        x_cond1[i, :cond1_prompt_lens[i]] = prompts[i][:cond1_prompt_lens[i]]
+        x_cond1[i, cond1_prompt_lens[i]:cond1_prompt_lens[i] + max_new_tokens] = mask_id
+    
+    # ----- Setup cond2 (question + llm_answer) canvas -----
+    cond2_prompt_lens = [p.shape[0] for p in prompts]
+    T_cond2 = max(cond2_prompt_lens) + max_new_tokens
+    
+    x_cond2 = torch.full((B, T_cond2), eos_id, dtype=torch.long, device=model.device)
+    for i, p in enumerate(prompts):
+        x_cond2[i, :cond2_prompt_lens[i]] = p
+        x_cond2[i, cond2_prompt_lens[i]:cond2_prompt_lens[i] + max_new_tokens] = mask_id
+    
+    # ----- Setup uncond (empty prompt) canvas -----
+    uncond_prompt_lens = [0] * B  # no prompt
+    T_uncond = max_new_tokens
+    
+    x_uncond = torch.full((B, T_uncond), eos_id, dtype=torch.long, device=model.device)
+    for i in range(B):
+        x_uncond[i, :max_new_tokens] = mask_id
+
+    # ----- Block scheduling -----
+    num_blocks = math.ceil(max_new_tokens / block_length)
+    steps_per_block = math.ceil(steps / num_blocks)
+    effective_steps_per_block: list[int] = []
+
+    for b in range(num_blocks):
+        # Build block mask for conditional (they share the same generation region)
+        block_mask_index = torch.zeros((B, block_length), dtype=torch.bool, device=x_cond2.device)
+        
+        for j in range(B):
+            start = cond2_prompt_lens[j] + b * block_length
+            end = min(start + block_length, cond2_prompt_lens[j] + max_new_tokens, T_cond2)
+            if start < end:
+                width = end - start
+                block_mask_index[j, :width] = (x_cond2[j, start:end] == mask_id)
+
+        num_transfer_tokens = get_num_transfer_tokens(
+            mask_index=block_mask_index,
+            steps=steps_per_block,
+            scheduler=scheduler,
+            stochastic=stochastic_transfer,
+        )
+
+        effective_steps = num_transfer_tokens.size(1)
+        effective_steps_per_block.append(effective_steps)
+
+        # ----- Iterative reveal -----
+        for step_i in range(effective_steps):
+            # Forward pass for all three conditions
+            cond1_logits = model(x_cond1).logits  # [B, T_cond1, V]
+            cond2_logits = model(x_cond2).logits  # [B, T_cond2, V]
+            uncond_logits = model(x_uncond).logits  # [B, T_uncond, V]
+            
+            # Extract generation region logits (all have same max_new_tokens)
+            cond1_gen_logits = torch.stack([
+                cond1_logits[j, cond1_prompt_lens[j]:cond1_prompt_lens[j] + max_new_tokens]
+                for j in range(B)
+            ], dim=0)  # [B, max_new_tokens, V]
+            
+            cond2_gen_logits = torch.stack([
+                cond2_logits[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens]
+                for j in range(B)
+            ], dim=0)  # [B, max_new_tokens, V]
+            
+            uncond_gen_logits = uncond_logits[:, :max_new_tokens, :]  # [B, max_new_tokens, V]
+            
+            # Apply dynamic CFG on generation region (per-position alpha)
+            # 1) Confidence per position from each branch (max softmax prob)
+            p1 = torch.softmax(cond1_gen_logits, dim=-1)  # [B, max_new_tokens, V]
+            p2 = torch.softmax(cond2_gen_logits, dim=-1)  # [B, max_new_tokens, V]
+            c1, _ = p1.max(dim=-1)  # [B, max_new_tokens]
+            c2, _ = p2.max(dim=-1)  # [B, max_new_tokens]
+
+            # cfg_scale1: cond1의 confidence가 높을수록 높게 (max=2.0)
+            cfg_scale1 = c1 * 2.0  # [B, max_new_tokens], range: [0, 2.0]
+
+            # cfg_scale2: cond2가 cond1보다 높을 때만 영향, 차이에 비례 (max=1.0)
+            cfg_scale2 = torch.clamp(torch.relu(c2 - c1), max=1.0)  # [B, max_new_tokens], range: [0, 1.0]
+
+            # Apply 3-condition CFG on generation region
+            # cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - cond1)
+            # Unsqueeze for broadcasting: [B, max_new_tokens] -> [B, max_new_tokens, 1]
+            cfg_gen_logits = (
+                uncond_gen_logits 
+                + (1 + cfg_scale1.unsqueeze(-1)) * (cond1_gen_logits - uncond_gen_logits)
+                + (1 + cfg_scale2.unsqueeze(-1)) * (cond2_gen_logits - cond1_gen_logits)
+            )
+            # Reconstruct full logits for all canvases
+            cond1_final_logits = cond1_logits.clone()   
+            for j in range(B):
+                cond1_final_logits[j, cond1_prompt_lens[j]:cond1_prompt_lens[j] + max_new_tokens] = cfg_gen_logits[j]
+            
+            cond2_final_logits = cond2_logits.clone()
+            for j in range(B):
+                cond2_final_logits[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens] = cfg_gen_logits[j]
+            
+            uncond_final_logits = uncond_logits.clone()
+            uncond_final_logits[:, :max_new_tokens, :] = cfg_gen_logits
+
+            # Argmax decoding with optional Gumbel noise on CFG-combined logits
+            cond1_logits_with_noise = add_gumbel_noise(cond1_final_logits, temperature=temperature)
+            x0_cond1 = torch.argmax(cond1_logits_with_noise, dim=-1)  # [B, T_cond1]
+            
+            cond2_logits_with_noise = add_gumbel_noise(cond2_final_logits, temperature=temperature)
+            x0_cond2 = torch.argmax(cond2_logits_with_noise, dim=-1)  # [B, T_cond2]
+            
+            uncond_logits_with_noise = add_gumbel_noise(uncond_final_logits, temperature=temperature)
+            x0_uncond = torch.argmax(uncond_logits_with_noise, dim=-1)  # [B, T_uncond]
+
+            # Compute confidence for remasking (based on CFG logits, use cond2 as reference)
+            if remasking == "low_confidence":
+                p = F.softmax(cond2_final_logits, dim=-1)
+                x0_p = torch.gather(p, dim=-1, index=x0_cond2.unsqueeze(-1)).squeeze(-1)
+            elif remasking == "random":
+                x0_p = torch.rand_like(x0_cond2, dtype=torch.float32)
+            else:
+                raise NotImplementedError(remasking)
+
+            # Restrict to current block
+            mask_index_cond2 = x_cond2 == mask_id
+            for j in range(B):
+                x0_p[j, cond2_prompt_lens[j] + (b + 1) * block_length:] = -np.inf
+
+            # Only update masked positions
+            x0_cond2 = torch.where(mask_index_cond2, x0_cond2, x_cond2)
+            confidence = torch.where(mask_index_cond2, x0_p, -np.inf)
+
+            # Select top-k positions to commit
+            transfer_index_cond2 = torch.zeros_like(x0_cond2, dtype=torch.bool)
+            for j in range(B):
+                k = int(num_transfer_tokens[j, step_i].item())
+                if k > 0:
+                    _, select_index = torch.topk(confidence[j], k=k)
+                    transfer_index_cond2[j, select_index] = True
+
+            # Commit CFG predictions to cond2 canvas (question + llm_answer)
+            x_cond2[transfer_index_cond2] = x0_cond2[transfer_index_cond2]
+            
+            # Sync cond1 and uncond canvases with same tokens
+            for j in range(B):
+                cond1_gen_start = cond1_prompt_lens[j]
+                cond2_gen_start = cond2_prompt_lens[j]
+                uncond_gen_start = 0
+                
+                gen_transfer_mask = transfer_index_cond2[j, cond2_gen_start:cond2_gen_start + max_new_tokens]
+                
+                if gen_transfer_mask.any():
+                    cfg_predicted_tokens = x0_cond2[j, cond2_gen_start:cond2_gen_start + max_new_tokens][gen_transfer_mask]
+                    
+                    # Update cond1
+                    cond1_gen_positions = torch.arange(
+                        cond1_gen_start, 
+                        cond1_gen_start + max_new_tokens, 
+                        device=x_cond1.device
+                    )[gen_transfer_mask]
+                    x_cond1[j, cond1_gen_positions] = cfg_predicted_tokens
+                    
+                    # Update uncond
+                    uncond_gen_positions = torch.arange(
+                        uncond_gen_start,
+                        uncond_gen_start + max_new_tokens,
+                        device=x_uncond.device
+                    )[gen_transfer_mask]
+                    x_uncond[j, uncond_gen_positions] = cfg_predicted_tokens
+
+    if not return_dict_in_generate:
+        return x_cond2
+    else:
+        return {
+            "effective_steps_per_block": effective_steps_per_block,
+            "sequences": x_cond2,
+        }
+    
+
 @torch.no_grad()
 def infilling(
     model: transformers.PreTrainedModel,

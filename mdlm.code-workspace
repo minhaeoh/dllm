@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "../mdlm"
+		},
+		{
+			"path": "../../../../data/diffusion"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../SMDM"
+		}
+	],
+	"settings": {}
+}

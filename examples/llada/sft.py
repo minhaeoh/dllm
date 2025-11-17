@@ -34,14 +34,22 @@ import accelerate
 
 import dllm
 from dllm.pipelines import llada
+import wandb
 
-data_name = "gsm8k_filter_1_0_1"
+data_name = "full_math_gsm8k_filter_all_1_0_1"
 max_length = 2056
+
+# wandb.init(project="finetuning", name=f"{data_name}_{max_length}")
+# wandb.config.update({
+#     "base_model": "LLaDA-8B-Instruct",
+#     "dataset": data_name,
+#     "max_length": max_length,
+# })
 
 @dataclass
 class ModelArguments(dllm.utils.ModelArguments):
     model_name_or_path: str = (
-        "GSAI-ML/LLaDA-8B-Base"  # "inclusionAI/LLaDA-MoE-7B-A1B-Base"
+        "GSAI-ML/LLaDA-8B-Instruct"  # "inclusionAI/LLaDA-MoE-7B-A1B-Base"
     )
 
 
@@ -55,7 +63,9 @@ class DataArguments(dllm.utils.DataArguments):
 
 @dataclass
 class TrainingArguments(dllm.utils.TrainingArguments):
-    output_dir: str = "models/LLaDA-8B-SFT/" + data_name + "_ml"+str(max_length)
+    project: str = "finetuning"
+    run_name: str = data_name + "_ml"+str(max_length)
+    output_dir: str = "models/LLaDA-8B-Instruct-SFT/" + data_name + "_ml"+str(max_length)
     # Enable LoRA for efficient fine-tuning
     lora: bool = field(
         default=True,
@@ -124,12 +134,15 @@ def train():
             outputs = super().__call__(features, return_tensors)
             outputs.pop("attention_mask")
             return outputs
-
+    if dataset.get("train") is None:
+        train_dataset = dataset
+    else:
+        train_dataset = dataset["train"]
     trainer = llada.LLaDATrainer(
         model=model,
         tokenizer=tokenizer,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset.get("test", None),
+        train_dataset=train_dataset,
+        eval_dataset=None,
         args=training_args,
         data_collator=LLaDASFTCollator(
             tokenizer,

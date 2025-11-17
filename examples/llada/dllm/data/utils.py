@@ -164,7 +164,7 @@ def load_sft_dataset(dataset_args: str):
         )
 
         if "gsm8k" in dataset_name_or_path:
-            data_dir = "/home/minhae/diffusion/dllm/examples/llada/dataset"
+            data_dir = "/home/minhae/diffusion/dllm/examples/llada/dataset/trainset"
             data_dir += "/" + dataset_name_or_path
             ds = load_from_disk(data_dir)
   
