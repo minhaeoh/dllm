@@ -50,6 +50,9 @@ class AllArguments:
     seed: int = 42
     cfg: int = 3  # 2/3
     cfg_style: str = "dynamic"  # static/dynamic
+    guidance_annealing: bool = True
+    guidance_step: float = 0.5
+    guidance_epsilon: float = 0.0
     cfg_scale: float = 0.0
     cfg_scale1: float = 2.0
     cfg_scale2: float = 0.5
@@ -68,6 +71,9 @@ cfg_style = args.cfg_style
 cfg_scale = args.cfg_scale
 cfg_scale1 = args.cfg_scale1
 cfg_scale2 = args.cfg_scale2
+guidance_annealing = args.guidance_annealing
+guidance_step = args.guidance_step
+guidance_epsilon = args.guidance_epsilon
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # Build config string based on cfg settings
@@ -81,6 +87,8 @@ if cfg == 2:
 elif cfg == 3:
     if cfg_style == "dynamic":
         config_str = f"cfg{cfg}_{cfg_style}_alpha_{args.alpha}_beta_{args.beta}"
+        if args.guidance_annealing:
+            config_str += "_guidance_annealing_" + str(guidance_step)+"_epsilon_"+str(guidance_epsilon)
         if args.log_cfg_scales:
             config_str += "_heatmap"
     elif cfg_style == "static":
@@ -247,7 +255,10 @@ with open(output_file, "w", encoding="utf-8") as log_f:
                     return_dict_in_generate=args.log_cfg_scales,
                     log_cfg_scales=args.log_cfg_scales,
                     alpha=args.alpha,
-                    beta=args.beta
+                    beta=args.beta,
+                    guidance_annealing=guidance_annealing,
+                    guidance_step=guidance_step,
+                    guidance_epsilon=guidance_epsilon
                 )
                 
                 # Extract sequences and log cfg_scales if available

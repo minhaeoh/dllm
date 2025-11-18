@@ -541,7 +541,7 @@ def generate_two_condition(
             cfg_gen_logits = cfg_scale * cond1_gen_logits + (1 - cfg_scale) * cond2_gen_logits
             
 
-
+            
             # Reconstruct full logits for conditional sequence (we only update x_cond)
             # For positions outside generation region, use original cond_logits
             cond1_final_logits = cond1_logits.clone()   
@@ -846,14 +846,16 @@ def generate_two_cfg_adaptive(
     cfg_scale2: float | None = None,
     alpha: float = 2.0,
     beta: float = 1.0,
-    cfg_keep_tokens: list = None,
+    guidance_annealing: bool = False,
+    guidance_step: float = 0.5,
+    guidance_epsilon: float = 0.0,
     remasking: str = "random",
     return_dict_in_generate: bool = False,
     stochastic_transfer: bool = False,
     log_cfg_scales: bool = False,  # New parameter to enable cfg_scale logging
 ) -> torch.Tensor | dict:
     """
-    Blockwise diffusion-style masked decoding with 3-condition CFG.
+    Blockwise diffusion-style masked decoding with 3-condition CFG and adaptive guidance.
 
     Three conditions:
       - uncond: empty prompt (no context)
@@ -862,15 +864,25 @@ def generate_two_cfg_adaptive(
     
     CFG formula:
       cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - cond1)
+    
+    Dynamic cfg_scale calculation:
+      - cfg_scale1 = c1 * alpha (cond1 confidence-based)
+      - cfg_scale2 (with guidance_annealing):
+        * Before guidance_step: cfg_scale2 = clamp(beta * c2, max=beta)
+        * After guidance_step: cfg_scale2 = clamp(ReLU(c2 - c1), max=beta)
 
     Args:
         prompts (list[torch.Tensor]):
             Full prompts (question + llm_answer) for each sample.
         q_len (list[int]):
             Length of question-only part for each sample.
-        cfg_scale1 (float): Weight for (cond1 - uncond) guidance.
-        cfg_scale2 (float): Weight for (cond2 - cond1) guidance.
-        log_cfg_scales (bool): If True, store cfg_scale values for logging.
+        cfg_scale1 (float): Ignored; dynamically computed from c1 * alpha.
+        cfg_scale2 (float): Ignored; dynamically computed based on guidance_annealing.
+        alpha (float): Multiplier for cond1 confidence (default: 2.0).
+        beta (float): Max clamp value for cfg_scale2 (default: 1.0).
+        guidance_annealing (bool): If True, apply scheduled guidance annealing.
+        guidance_step (float): Infilling progress threshold (0.0-1.0) to switch cfg_scale2 formula (default: 0.5).
+        log_cfg_scales (bool): If True, store cfg_scale and confidence values for logging.
         Other args similar to generate().
     """
     assert 1 <= block_length <= max_new_tokens
@@ -917,6 +929,16 @@ def generate_two_cfg_adaptive(
     cfg_scale2_history = [] if log_cfg_scales else None
     c1_history = [] if log_cfg_scales else None
     c2_history = [] if log_cfg_scales else None
+    
+    # Initialize guidance annealing tracking
+    if guidance_annealing:
+        total_initial_masks = 0
+        total_revealed = 0
+        # Calculate total masks across all blocks at the beginning
+        for j in range(B):
+            gen_start = cond2_prompt_lens[j]
+            gen_end = gen_start + max_new_tokens
+            total_initial_masks += (x_cond2[j, gen_start:gen_end] == mask_id).sum().item()
 
     for b in range(num_blocks):
         # Build block mask for conditional (they share the same generation region)
@@ -968,8 +990,20 @@ def generate_two_cfg_adaptive(
             # cfg_scale1: cond1의 confidence가 높을수록 높게 (max=2.0)
             cfg_scale1 = (c1 * alpha).unsqueeze(-1)  # [B, max_new_tokens, 1]
 
-            # cfg_scale2: cond2가 cond1보다 높을 때만 영향, 차이에 비례 (max=1.0)
-            cfg_scale2 = torch.clamp(torch.relu(c2 - c1), max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+            # cfg_scale2: guidance annealing 적용
+            if guidance_annealing:
+                # Calculate current infilling progress (how much has been revealed)
+                infilling_progress = total_revealed / total_initial_masks if total_initial_masks > 0 else 0.0
+                
+                if infilling_progress < guidance_step:
+                    # Early stage: use simple c2 scaling (더 강한 guidance)
+                    cfg_scale2 = torch.clamp(beta * c2, max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+                else:
+                    # Later stage: use ReLU(c2 - c1) (더 selective한 guidance)
+                    cfg_scale2 = torch.clamp(torch.relu(c2 - (c1 + guidance_epsilon)), max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+            else:
+                # Default: cond2가 cond1보다 높을 때만 영향, 차이에 비례 (max=beta)
+                cfg_scale2 = torch.clamp(torch.relu(c2 - c1), max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
             
             # Store cfg_scale and confidence values for logging (before unsqueeze, store 2D version)
             if log_cfg_scales:
@@ -1041,6 +1075,10 @@ def generate_two_cfg_adaptive(
             # Commit CFG predictions to cond2 canvas (question + llm_answer)
             x_cond2[transfer_index_cond2] = x0_cond2[transfer_index_cond2]
             
+            # Update total_revealed count for guidance annealing
+            if guidance_annealing:
+                total_revealed += transfer_index_cond2.sum().item()
+            
             # Sync cond1 and uncond canvases with same tokens
             for j in range(B):
                 cond1_gen_start = cond1_prompt_lens[j]
@@ -1085,7 +1123,7 @@ def generate_two_cfg_adaptive(
             result["c1_history"] = c1_history  # List of [B, max_new_tokens] tensors
             result["c2_history"] = c2_history  # List of [B, max_new_tokens] tensors
         return result
-    
+
 
 @torch.no_grad()
 def infilling(
