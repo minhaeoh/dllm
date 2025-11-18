@@ -844,10 +844,13 @@ def generate_two_cfg_adaptive(
     temperature: float = 0.0,
     cfg_scale1: float | None = None,
     cfg_scale2: float | None = None,
+    alpha: float = 2.0,
+    beta: float = 1.0,
     cfg_keep_tokens: list = None,
     remasking: str = "random",
     return_dict_in_generate: bool = False,
     stochastic_transfer: bool = False,
+    log_cfg_scales: bool = False,  # New parameter to enable cfg_scale logging
 ) -> torch.Tensor | dict:
     """
     Blockwise diffusion-style masked decoding with 3-condition CFG.
@@ -867,6 +870,7 @@ def generate_two_cfg_adaptive(
             Length of question-only part for each sample.
         cfg_scale1 (float): Weight for (cond1 - uncond) guidance.
         cfg_scale2 (float): Weight for (cond2 - cond1) guidance.
+        log_cfg_scales (bool): If True, store cfg_scale values for logging.
         Other args similar to generate().
     """
     assert 1 <= block_length <= max_new_tokens
@@ -907,6 +911,12 @@ def generate_two_cfg_adaptive(
     num_blocks = math.ceil(max_new_tokens / block_length)
     steps_per_block = math.ceil(steps / num_blocks)
     effective_steps_per_block: list[int] = []
+    
+    # Store cfg_scale and confidence values for visualization (if enabled)
+    cfg_scale1_history = [] if log_cfg_scales else None
+    cfg_scale2_history = [] if log_cfg_scales else None
+    c1_history = [] if log_cfg_scales else None
+    c2_history = [] if log_cfg_scales else None
 
     for b in range(num_blocks):
         # Build block mask for conditional (they share the same generation region)
@@ -951,55 +961,65 @@ def generate_two_cfg_adaptive(
             
             # Apply dynamic CFG on generation region (per-position alpha)
             # 1) Confidence per position from each branch (max softmax prob)
-            p1 = torch.softmax(cond1_gen_logits, dim=-1)  # [B, max_new_tokens, V]
-            p2 = torch.softmax(cond2_gen_logits, dim=-1)  # [B, max_new_tokens, V]
-            c1, _ = p1.max(dim=-1)  # [B, max_new_tokens]
-            c2, _ = p2.max(dim=-1)  # [B, max_new_tokens]
+            # Memory optimization: compute confidence directly without storing full softmax
+            c1 = torch.softmax(cond1_gen_logits, dim=-1).max(dim=-1)[0]  # [B, max_new_tokens]
+            c2 = torch.softmax(cond2_gen_logits, dim=-1).max(dim=-1)[0]  # [B, max_new_tokens]
 
             # cfg_scale1: cond1의 confidence가 높을수록 높게 (max=2.0)
-            cfg_scale1 = c1 * 2.0  # [B, max_new_tokens], range: [0, 2.0]
+            cfg_scale1 = (c1 * alpha).unsqueeze(-1)  # [B, max_new_tokens, 1]
 
             # cfg_scale2: cond2가 cond1보다 높을 때만 영향, 차이에 비례 (max=1.0)
-            cfg_scale2 = torch.clamp(torch.relu(c2 - c1), max=1.0)  # [B, max_new_tokens], range: [0, 1.0]
+            cfg_scale2 = torch.clamp(torch.relu(c2 - c1), max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+            
+            # Store cfg_scale and confidence values for logging (before unsqueeze, store 2D version)
+            if log_cfg_scales:
+                cfg_scale1_history.append(cfg_scale1.squeeze(-1).detach().cpu())  # [B, max_new_tokens]
+                cfg_scale2_history.append(cfg_scale2.squeeze(-1).detach().cpu())  # [B, max_new_tokens]
+                c1_history.append(c1.detach().cpu())  # [B, max_new_tokens]
+                c2_history.append(c2.detach().cpu())  # [B, max_new_tokens]
+            
+            # Free memory
+            del c1, c2
 
             # Apply 3-condition CFG on generation region
             # cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - cond1)
-            # Unsqueeze for broadcasting: [B, max_new_tokens] -> [B, max_new_tokens, 1]
-            cfg_gen_logits = (
-                uncond_gen_logits 
-                + (1 + cfg_scale1.unsqueeze(-1)) * (cond1_gen_logits - uncond_gen_logits)
-                + (1 + cfg_scale2.unsqueeze(-1)) * (cond2_gen_logits - cond1_gen_logits)
-            )
-            # Reconstruct full logits for all canvases
-            cond1_final_logits = cond1_logits.clone()   
-            for j in range(B):
-                cond1_final_logits[j, cond1_prompt_lens[j]:cond1_prompt_lens[j] + max_new_tokens] = cfg_gen_logits[j]
+            # Memory-efficient computation
+            diff1 = cond1_gen_logits - uncond_gen_logits
+            diff2 = cond2_gen_logits - cond1_gen_logits
             
-            cond2_final_logits = cond2_logits.clone()
+            cfg_gen_logits = uncond_gen_logits + (1 + cfg_scale1) * diff1 + (1 + cfg_scale2) * diff2
+            
+            # Free memory
+            del diff1, diff2, cfg_scale1, cfg_scale2, cond1_gen_logits, cond2_gen_logits, uncond_gen_logits
+            
+            # Reconstruct full logits for all canvases (in-place when possible)
+            cond2_final_logits = cond2_logits
             for j in range(B):
                 cond2_final_logits[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens] = cfg_gen_logits[j]
             
-            uncond_final_logits = uncond_logits.clone()
-            uncond_final_logits[:, :max_new_tokens, :] = cfg_gen_logits
+            # Free memory
+            del cond1_logits, uncond_logits
 
             # Argmax decoding with optional Gumbel noise on CFG-combined logits
-            cond1_logits_with_noise = add_gumbel_noise(cond1_final_logits, temperature=temperature)
-            x0_cond1 = torch.argmax(cond1_logits_with_noise, dim=-1)  # [B, T_cond1]
-            
+            # Only need cond2 for this function
             cond2_logits_with_noise = add_gumbel_noise(cond2_final_logits, temperature=temperature)
             x0_cond2 = torch.argmax(cond2_logits_with_noise, dim=-1)  # [B, T_cond2]
             
-            uncond_logits_with_noise = add_gumbel_noise(uncond_final_logits, temperature=temperature)
-            x0_uncond = torch.argmax(uncond_logits_with_noise, dim=-1)  # [B, T_uncond]
+            # Free memory
+            del cond2_logits_with_noise
 
             # Compute confidence for remasking (based on CFG logits, use cond2 as reference)
             if remasking == "low_confidence":
                 p = F.softmax(cond2_final_logits, dim=-1)
                 x0_p = torch.gather(p, dim=-1, index=x0_cond2.unsqueeze(-1)).squeeze(-1)
+                del p
             elif remasking == "random":
                 x0_p = torch.rand_like(x0_cond2, dtype=torch.float32)
             else:
                 raise NotImplementedError(remasking)
+
+            # Free memory
+            del cond2_final_logits, cfg_gen_logits
 
             # Restrict to current block
             mask_index_cond2 = x_cond2 == mask_id
@@ -1047,14 +1067,24 @@ def generate_two_cfg_adaptive(
                         device=x_uncond.device
                     )[gen_transfer_mask]
                     x_uncond[j, uncond_gen_positions] = cfg_predicted_tokens
+            
+            # Free memory at end of step
+            del x0_cond2, x0_p, confidence, transfer_index_cond2, mask_index_cond2
+            torch.cuda.empty_cache()
 
     if not return_dict_in_generate:
         return x_cond2
     else:
-        return {
+        result = {
             "effective_steps_per_block": effective_steps_per_block,
             "sequences": x_cond2,
         }
+        if log_cfg_scales:
+            result["cfg_scale1_history"] = cfg_scale1_history  # List of [B, max_new_tokens] tensors
+            result["cfg_scale2_history"] = cfg_scale2_history  # List of [B, max_new_tokens] tensors
+            result["c1_history"] = c1_history  # List of [B, max_new_tokens] tensors
+            result["c2_history"] = c2_history  # List of [B, max_new_tokens] tensors
+        return result
     
 
 @torch.no_grad()

@@ -23,6 +23,9 @@ import wandb
 from datetime import datetime
 import os
 import json
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from datasets import load_from_disk
 
@@ -35,25 +38,26 @@ class AllArguments:
     num_proc: int = 8
     
     # Script arguments
-    model_name: str = "gsm8k_filter_all_1_0_1_ml2056"
-    model_path: str = "/home/minhae/diffusion/dllm/models/LLaDA-8B-SFT/gsm8k_filter_all_1_0_1_ml2056/checkpoint-final"
+    model_name: str = "math_gsm8k_filter_all_1_0_1_ml2056"
+    model_path: str = "/home/minhae/diffusion/dllm/models_nlp/LLaDA-8B-SFT/math_gsm8k_filter_all_1_0_1_ml2056/checkpoint-final"
+    # model_name: str = "LLaDA-8B-Instruct"
+    # model_path: str = "GSAI-ML/LLaDA-8B-Instruct"
     steps: int = 128
-    max_new_tokens: int = 1024
+    max_new_tokens: int = 256
     block_length: int = 32
     temperature: float = 0.0
     remasking: str = "low_confidence"
     seed: int = 42
-    cfg: int = 2  # 2/3
-    cfg_style: str = "static"  # static/dynamic
+    cfg: int = 3  # 2/3
+    cfg_style: str = "dynamic"  # static/dynamic
     cfg_scale: float = 0.0
-    cfg_scale1: float = 1.0
-    cfg_scale2: float = 3.0
-    prompt: int = 0 # 0:no prompt, 1:debate prompt
-    
-    def __post_init__(self):
-        self.model_name_or_path = dllm.utils.resolve_with_base_env(
-            self.model_name_or_path, "BASE_MODELS_DIR"
-        )
+    cfg_scale1: float = 2.0
+    cfg_scale2: float = 0.5
+    alpha: float = 2.0
+    beta: float = 1.0
+    prompt: bool = False # False:no prompt, True:debate prompt
+    log_cfg_scales: bool = True
+
 
 args = tyro.cli(AllArguments)
 transformers.set_seed(args.seed)
@@ -76,7 +80,9 @@ if cfg == 2:
         raise ValueError(f"Invalid cfg_style: {cfg_style}")
 elif cfg == 3:
     if cfg_style == "dynamic":
-        config_str = f"cfg{cfg}_{cfg_style}"
+        config_str = f"cfg{cfg}_{cfg_style}_alpha_{args.alpha}_beta_{args.beta}"
+        if args.log_cfg_scales:
+            config_str += "_heatmap"
     elif cfg_style == "static":
         config_str = f"cfg{cfg}_{cfg_style}_{cfg_scale1}_{cfg_scale2}"
     else:
@@ -88,13 +94,19 @@ if args.prompt:
     config_str += "_prompt"
 else:
     config_str += "_noprompt"
+config_str += "_max_"+str(args.max_new_tokens)
 
 # Output logging setup
 output_dir = os.path.join(os.path.dirname(__file__), "outputs",task,args.model_name,config_str)
 os.makedirs(output_dir, exist_ok=True)
 output_file = os.path.join(output_dir, f"{timestamp}.jsonl")
 
-wandb.init(project="evaluation", name=f"{task}_{args.model_name}_{config_str}_{timestamp}")
+# Create heatmap directory if logging cfg_scales
+if args.cfg == 3 and args.log_cfg_scales:
+    heatmap_dir = os.path.join(output_dir, f"heatmaps_{timestamp}")
+    os.makedirs(heatmap_dir, exist_ok=True)
+
+wandb.init(project="evaluation-gsm8k", name=f"{args.model_name}_{config_str}_{timestamp}")
 wandb.config.update({
     "model": args.model_name,
     "config": config_str,
@@ -122,7 +134,7 @@ def to_int_safe(s: str) -> int:
     return int(re.sub(r"[^\d+-]", "", s))  # 숫자/부호 외 제거 (콤마, 공백 등)
 
 # ----- Data loading -----
-def custom_apply_chat_template(row, prompt: int):
+def custom_apply_chat_template(row, prompt: bool):
     # Don't move to device in multiprocessing context
     # Return as lists to avoid tensor serialization issues
     # for i in range(len(messages)):
@@ -152,7 +164,7 @@ def custom_apply_chat_template(row, prompt: int):
         tokenize=True,
         return_tensors="pt",
     )[0].tolist()
-    return {"q_llm_input_ids": q_llm_input_ids, "q_input_ids": q_input_ids, "q_len": len(q_input_ids), "gold_answer": row["gold_answer"].replace(",", "")}
+    return {"q_llm_input_ids": q_llm_input_ids, "q_input_ids": q_input_ids, "q_len": len(q_input_ids), "gold_answer": row["gold_answer"].replace(",", ""), 'initial_correct': row['llm_correct'], 'initial_answer': row['llm_pred_answer']}
 
 
 
@@ -208,6 +220,7 @@ with open(output_file, "w", encoding="utf-8") as log_f:
                 )
             elif cfg_style == "static":
                 out = llada.generate_two_condition(
+                    model,
                     tokenizer,
                     batch_input_ids,
                     batch_q_len,
@@ -220,7 +233,8 @@ with open(output_file, "w", encoding="utf-8") as log_f:
                 )
         elif cfg == 3:
             if cfg_style == "dynamic":
-                out = llada.generate_two_cfg_adaptive(
+                # Log cfg_scales for all samples if enabled
+                result = llada.generate_two_cfg_adaptive(
                     model,
                     tokenizer,
                     batch_input_ids,
@@ -229,8 +243,72 @@ with open(output_file, "w", encoding="utf-8") as log_f:
                     max_new_tokens=args.max_new_tokens,
                     block_length=args.block_length,
                     temperature=args.temperature,
-                    remasking=args.remasking
+                    remasking=args.remasking,
+                    return_dict_in_generate=args.log_cfg_scales,
+                    log_cfg_scales=args.log_cfg_scales,
+                    alpha=args.alpha,
+                    beta=args.beta
                 )
+                
+                # Extract sequences and log cfg_scales if available
+                if args.log_cfg_scales:
+                    out = result["sequences"]
+                    cfg_scale1_history = result.get("cfg_scale1_history", None)
+                    cfg_scale2_history = result.get("cfg_scale2_history", None)
+                    c1_history = result.get("c1_history", None)
+                    c2_history = result.get("c2_history", None)
+                    
+                    # Log cfg_scale and confidence heatmaps to local files for ALL samples in batch
+                    if cfg_scale1_history and cfg_scale2_history and c1_history and c2_history:
+                        # Stack all steps: [num_steps, B, max_new_tokens]
+                        scale1_tensor = torch.stack(cfg_scale1_history, dim=0).float()  # [num_steps, B, max_new_tokens]
+                        scale2_tensor = torch.stack(cfg_scale2_history, dim=0).float()  # [num_steps, B, max_new_tokens]
+                        c1_tensor = torch.stack(c1_history, dim=0).float()  # [num_steps, B, max_new_tokens]
+                        c2_tensor = torch.stack(c2_history, dim=0).float()  # [num_steps, B, max_new_tokens]
+                        
+                        # Create heatmap for each sample in the batch
+                        for sample_idx in range(scale1_tensor.shape[1]):
+                            scale1_array = scale1_tensor[:, sample_idx, :].numpy()  # [num_steps, max_new_tokens]
+                            scale2_array = scale2_tensor[:, sample_idx, :].numpy()  # [num_steps, max_new_tokens]
+                            c1_array = c1_tensor[:, sample_idx, :].numpy()  # [num_steps, max_new_tokens]
+                            c2_array = c2_tensor[:, sample_idx, :].numpy()  # [num_steps, max_new_tokens]
+                            
+                            # Create heatmaps (4 subplots: cfg_scale1, cfg_scale2, c1, c2)
+                            fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+                            
+                            # CFG Scale 1 heatmap
+                            sns.heatmap(scale1_array, ax=axes[0, 0], cmap='YlOrRd', cbar_kws={'label': 'cfg_scale1'})
+                            axes[0, 0].set_title(f'Sample {batch_start + sample_idx}: CFG Scale 1 (cond1 confidence)')
+                            axes[0, 0].set_xlabel('Token Position')
+                            axes[0, 0].set_ylabel('Generation Step')
+                            
+                            # CFG Scale 2 heatmap
+                            sns.heatmap(scale2_array, ax=axes[0, 1], cmap='YlGnBu', cbar_kws={'label': 'cfg_scale2'})
+                            axes[0, 1].set_title(f'Sample {batch_start + sample_idx}: CFG Scale 2 (cond2 advantage)')
+                            axes[0, 1].set_xlabel('Token Position')
+                            axes[0, 1].set_ylabel('Generation Step')
+                            
+                            # C1 confidence heatmap
+                            sns.heatmap(c1_array, ax=axes[1, 0], cmap='Greens', cbar_kws={'label': 'c1'})
+                            axes[1, 0].set_title(f'Sample {batch_start + sample_idx}: C1 Confidence (cond1)')
+                            axes[1, 0].set_xlabel('Token Position')
+                            axes[1, 0].set_ylabel('Generation Step')
+                            
+                            # C2 confidence heatmap
+                            sns.heatmap(c2_array, ax=axes[1, 1], cmap='Blues', cbar_kws={'label': 'c2'})
+                            axes[1, 1].set_title(f'Sample {batch_start + sample_idx}: C2 Confidence (cond2)')
+                            axes[1, 1].set_xlabel('Token Position')
+                            axes[1, 1].set_ylabel('Generation Step')
+                            
+                            plt.tight_layout()
+                            
+                            # Save heatmap to file (local only, not to wandb)
+                            heatmap_file = os.path.join(heatmap_dir, f"sample_{batch_start + sample_idx}.png")
+                            fig.savefig(heatmap_file, dpi=150, bbox_inches='tight')
+                            plt.close(fig)
+                else:
+                    out = result
+                    
             elif cfg_style == "static":
                 out = llada.generate_two_cfg(
                     model,
@@ -277,9 +355,13 @@ with open(output_file, "w", encoding="utf-8") as log_f:
             record = {
                 "global_index": batch_start + i,
                 "accuracy": total_correct/total_processed*100,
-                "gold_answer": results[batch_start + i]["gold_answer"],
+                "refined_correct": is_correct,                
+                "initial_correct": results[batch_start + i]["initial_correct"],
+                "alpha": args.alpha,
+                "beta": args.beta,
                 "extracted_answer": generated_answer,
-                "correct": is_correct,
+                "initial_answer": results[batch_start + i]["initial_answer"],
+                "gold_answer": results[batch_start + i]["gold_answer"],
                 "total_input": total_input,
                 "input_question": question,
                 "generated_text": generated_text,                
