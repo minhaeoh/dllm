@@ -48,9 +48,9 @@ class AllArguments:
     temperature: float = 0.0
     remasking: str = "low_confidence"
     seed: int = 42
-    cfg: int = 3  # 2/3
+    cfg: int = 3  # 2/3/0
     cfg_style: str = "dynamic"  # static/dynamic
-    guidance_annealing: bool = True
+    guidance_annealing: bool = False
     guidance_step: float = 0.5
     guidance_epsilon: float = 0.0
     cfg_scale: float = 0.0
@@ -60,6 +60,7 @@ class AllArguments:
     beta: float = 1.0
     prompt: bool = False # False:no prompt, True:debate prompt
     log_cfg_scales: bool = True
+    reverse : bool = False
 
 
 args = tyro.cli(AllArguments)
@@ -95,6 +96,8 @@ elif cfg == 3:
         config_str = f"cfg{cfg}_{cfg_style}_{cfg_scale1}_{cfg_scale2}"
     else:
         raise ValueError(f"Invalid cfg_style: {cfg_style}")
+elif cfg == 0:
+    config_str = "base_refinement"
 else:
     raise ValueError(f"Invalid cfg: {cfg}")
 
@@ -103,7 +106,8 @@ if args.prompt:
 else:
     config_str += "_noprompt"
 config_str += "_max_"+str(args.max_new_tokens)
-
+if args.reverse:
+    config_str += "_reverse"
 # Output logging setup
 output_dir = os.path.join(os.path.dirname(__file__), "outputs",task,args.model_name,config_str)
 os.makedirs(output_dir, exist_ok=True)
@@ -148,13 +152,23 @@ def custom_apply_chat_template(row, prompt: bool):
     # for i in range(len(messages)):
     #     print(f"Message {i}: {messages[i]}")
     messages = []
-    if prompt :
-        messages.append({"role": "user", "content": "This the solutions to the problem from other agent: " + row["llm_output"]})
-        messages.append({"role": "user", "content": "Using the solutions from other agents as additional information, can you provide your answer to the math problem? The original math problem is " + row["question"] + ". Your final answer should be a single numerical number, in the form 'the answer is: <answer>', at the end of your response."})
-    else :
-        messages.append({"role": "user", "content": row["question"]})
-        messages.append({"role": "LLM generated Answer", "content": row["llm_output"]})
-    
+    if args.reverse:
+        if prompt :
+            messages.append({"role": "user", "content": "This the solutions to the problem from other agent: " + row["llm_output"]})
+            messages.append({"role": "user", "content": "Using the solutions from other agents as additional information, can you provide your answer to the math problem? The original math problem is " + row["question"] + ". Your final answer should be a single numerical number, in the form 'the answer is: <answer>', at the end of your response."})
+        else :
+            messages.append({"role": "LLM generated Answer", "content": row["llm_output"]})
+            messages.append({"role": "user", "content": row["question"]})
+            
+        
+    else:
+        if prompt :
+            messages.append({"role": "user", "content": " The original math problem is " + row["question"] + ". Your final answer should be a single numerical number, in the form 'the answer is: <answer>', at the end of your response."})
+            messages.append({"role": "user", "content": "Using the solutions from other agents as additional information, can you provide your answer to the math problem? This the solutions to the problem from other agent: " + row["llm_output"]})
+        else :
+            messages.append({"role": "user", "content": row["question"]})
+            messages.append({"role": "LLM generated Answer", "content": row["llm_output"]})
+        
     # #for baseline
     # if script_args.prompt:
     #     messages[0]["content"] = "Carefully solve the problem step by step. Finish with The answer is: <answer>. " + messages[0]["content"]
@@ -213,7 +227,18 @@ with open(output_file, "w", encoding="utf-8") as log_f:
         batch_input_ids = input_ids_list[batch_start:batch_end]
         batch_q_len = q_len[batch_start:batch_end]
         
-        if cfg == 2:
+        if cfg == 0:
+            out = llada.generate(
+            model,
+            tokenizer,
+            batch_input_ids,
+            steps=args.steps,
+            max_new_tokens=args.max_new_tokens,
+            block_length=args.block_length,
+            temperature=args.temperature,
+            )
+            
+        elif cfg == 2:
             if cfg_style == "dynamic":
                 out = llada.generate_two_condition_dynamic(
                     model,
