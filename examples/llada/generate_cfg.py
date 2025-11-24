@@ -29,7 +29,6 @@ import seaborn as sns
 
 from datasets import load_from_disk
 
-task = "gsm8k"
 @dataclass
 class AllArguments:
     """Combined arguments for data and script"""
@@ -38,8 +37,9 @@ class AllArguments:
     num_proc: int = 8
     
     # Script arguments
-    model_name: str = "math_gsm8k_filter_all_1_0_1_ml2056"
-    model_path: str = "/home/minhae/diffusion/dllm/models_nlp/LLaDA-8B-SFT/math_gsm8k_filter_all_1_0_1_ml2056/checkpoint-final"
+    task : str = "gsm8k-filtered"
+    model_name: str = "Instruct-SFT-middle"
+    model_path: str = "/home/minhae/diffusion/dllm/models_nlp/LLaDA-8B-Instruct-SFT/math_gsm8k_filter_all_1_0_1_ml2056/checkpoint-335746"
     # model_name: str = "LLaDA-8B-Instruct"
     # model_path: str = "GSAI-ML/LLaDA-8B-Instruct"
     steps: int = 128
@@ -48,18 +48,19 @@ class AllArguments:
     temperature: float = 0.0
     remasking: str = "low_confidence"
     seed: int = 42
-    cfg: int = 3  # 2/3/0
+    cfg: int = 3  # 2/3/0/4
     cfg_style: str = "dynamic"  # static/dynamic
     guidance_annealing: bool = False
+    guidance_type: str = "threshold" # "threshold" or "linear"
     guidance_step: float = 0.5
-    guidance_epsilon: float = 0.0
+    epsilon: float = 0.0
     cfg_scale: float = 0.0
     cfg_scale1: float = 2.0
     cfg_scale2: float = 0.5
     alpha: float = 2.0
     beta: float = 1.0
-    prompt: bool = False # False:no prompt, True:debate prompt
-    log_cfg_scales: bool = True
+    prompt: bool = True # False:no prompt, True:debate prompt
+    log_cfg_scales: bool = False
     reverse : bool = False
 
 
@@ -67,14 +68,17 @@ args = tyro.cli(AllArguments)
 transformers.set_seed(args.seed)
 
 # Extract config values
+task = args.task
+
 cfg = args.cfg
 cfg_style = args.cfg_style
 cfg_scale = args.cfg_scale
 cfg_scale1 = args.cfg_scale1
 cfg_scale2 = args.cfg_scale2
 guidance_annealing = args.guidance_annealing
+guidance_type = args.guidance_type
 guidance_step = args.guidance_step
-guidance_epsilon = args.guidance_epsilon
+epsilon = args.epsilon
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
 # Build config string based on cfg settings
@@ -87,9 +91,11 @@ if cfg == 2:
         raise ValueError(f"Invalid cfg_style: {cfg_style}")
 elif cfg == 3:
     if cfg_style == "dynamic":
-        config_str = f"cfg{cfg}_{cfg_style}_alpha_{args.alpha}_beta_{args.beta}"
+        config_str = f"cfg{cfg}_{cfg_style}_alpha_{args.alpha}_beta_{args.beta}_eps_{args.epsilon}"
         if args.guidance_annealing:
-            config_str += "_guidance_annealing_" + str(guidance_step)+"_epsilon_"+str(guidance_epsilon)
+            config_str += "_guidance_annealing_" + str(guidance_type) 
+            if guidance_type == "threshold":
+                config_str += "_" + str(guidance_step)
         if args.log_cfg_scales:
             config_str += "_heatmap"
     elif cfg_style == "static":
@@ -98,6 +104,14 @@ elif cfg == 3:
         raise ValueError(f"Invalid cfg_style: {cfg_style}")
 elif cfg == 0:
     config_str = "base_refinement"
+elif cfg == 4:
+    config_str = f"cfg{cfg}_{cfg_style}_alpha_{args.alpha}_beta_{args.beta}_eps_{args.epsilon}"
+    if args.guidance_annealing:
+        config_str += "_guidance_annealing_" + str(guidance_type) 
+        if guidance_type == "threshold":
+            config_str += "_" + str(guidance_step)
+    if args.log_cfg_scales:
+        config_str += "_heatmap"
 else:
     raise ValueError(f"Invalid cfg: {cfg}")
 
@@ -118,11 +132,28 @@ if args.cfg == 3 and args.log_cfg_scales:
     heatmap_dir = os.path.join(output_dir, f"heatmaps_{timestamp}")
     os.makedirs(heatmap_dir, exist_ok=True)
 
-wandb.init(project="evaluation-gsm8k", name=f"{args.model_name}_{config_str}_{timestamp}")
+wandb.init(project="evaluation-gsm8k-filtered", name=f"{args.model_name}_{config_str}_{timestamp}")
 wandb.config.update({
     "model": args.model_name,
     "config": config_str,
     "timestamp": timestamp,
+    "task": task,
+    "cfg": cfg,
+    "cfg_style": cfg_style,
+    "cfg_scale": cfg_scale,
+    "cfg_scale1": cfg_scale1,
+    "cfg_scale2": cfg_scale2,
+    "guidance_type": guidance_type,
+    "guidance_step": guidance_step,
+    "epsilon": epsilon,
+    "guidance_annealing": guidance_annealing,
+    "remasking": args.remasking,
+    "prompt": args.prompt,
+    "reverse": args.reverse,
+    "steps": args.steps,
+    "max_new_tokens": args.max_new_tokens,
+    "block_length": args.block_length,
+    "temperature": args.temperature,
 })
 
 
@@ -163,7 +194,7 @@ def custom_apply_chat_template(row, prompt: bool):
         
     else:
         if prompt :
-            messages.append({"role": "user", "content": " The original math problem is " + row["question"] + ". Your final answer should be a single numerical number, in the form 'the answer is: <answer>', at the end of your response."})
+            messages.append({"role": "user", "content": "Solve the math problem step by step. The problem is: " + row["question"] + ". Your final answer should be a single numerical number, in the form 'the answer is: <answer>', at the end of your response."})
             messages.append({"role": "user", "content": "Using the solutions from other agents as additional information, can you provide your answer to the math problem? This the solutions to the problem from other agent: " + row["llm_output"]})
         else :
             messages.append({"role": "user", "content": row["question"]})
@@ -195,7 +226,11 @@ def sft_map_fn(row) -> dict:
 
 with accelerate.PartialState().local_main_process_first():
     dataset = load_from_disk(args.dataset_args)
-    print("test dataset length: ", len(dataset))
+    if task == "gsm8k-filtered":
+        dataset = dataset.filter(lambda x: x['llm_correct'] == False)
+        print("filtered test dataset length: ", len(dataset))
+    else:
+        print("total test dataset length: ", len(dataset))
     # INSERT_YOUR_CODE
     # Ensure only unique ids: keep only the first occurrence if duplicated
     
@@ -282,8 +317,9 @@ with open(output_file, "w", encoding="utf-8") as log_f:
                     alpha=args.alpha,
                     beta=args.beta,
                     guidance_annealing=guidance_annealing,
+                    guidance_type=guidance_type,
                     guidance_step=guidance_step,
-                    guidance_epsilon=guidance_epsilon
+                    epsilon=epsilon
                 )
                 
                 # Extract sequences and log cfg_scales if available
@@ -361,6 +397,86 @@ with open(output_file, "w", encoding="utf-8") as log_f:
                 )
             else:
                 raise ValueError(f"Invalid cfg_style: {cfg_style}")
+        elif cfg == 4:
+            # Log cfg_scales for all samples if enabled
+            result = llada.generate_two_cfg_adaptive_uncond(
+                model,
+                tokenizer,
+                batch_input_ids,
+                batch_q_len,
+                steps=args.steps,
+                max_new_tokens=args.max_new_tokens,
+                block_length=args.block_length,
+                temperature=args.temperature,
+                remasking=args.remasking,
+                return_dict_in_generate=args.log_cfg_scales,
+                log_cfg_scales=args.log_cfg_scales,
+                alpha=args.alpha,
+                beta=args.beta,
+                guidance_annealing=guidance_annealing,
+                guidance_type=guidance_type,
+                guidance_step=guidance_step,
+                epsilon=epsilon
+            )
+            
+            # Extract sequences and log cfg_scales if available
+            if args.log_cfg_scales:
+                out = result["sequences"]
+                cfg_scale1_history = result.get("cfg_scale1_history", None)
+                cfg_scale2_history = result.get("cfg_scale2_history", None)
+                c1_history = result.get("c1_history", None)
+                c2_history = result.get("c2_history", None)
+                
+                # Log cfg_scale and confidence heatmaps to local files for ALL samples in batch
+                if cfg_scale1_history and cfg_scale2_history and c1_history and c2_history:
+                    # Stack all steps: [num_steps, B, max_new_tokens]
+                    scale1_tensor = torch.stack(cfg_scale1_history, dim=0).float()  # [num_steps, B, max_new_tokens]
+                    scale2_tensor = torch.stack(cfg_scale2_history, dim=0).float()  # [num_steps, B, max_new_tokens]
+                    c1_tensor = torch.stack(c1_history, dim=0).float()  # [num_steps, B, max_new_tokens]
+                    c2_tensor = torch.stack(c2_history, dim=0).float()  # [num_steps, B, max_new_tokens]
+                    
+                    # Create heatmap for each sample in the batch
+                    for sample_idx in range(scale1_tensor.shape[1]):
+                        scale1_array = scale1_tensor[:, sample_idx, :].numpy()  # [num_steps, max_new_tokens]
+                        scale2_array = scale2_tensor[:, sample_idx, :].numpy()  # [num_steps, max_new_tokens]
+                        c1_array = c1_tensor[:, sample_idx, :].numpy()  # [num_steps, max_new_tokens]
+                        c2_array = c2_tensor[:, sample_idx, :].numpy()  # [num_steps, max_new_tokens]
+                        
+                        # Create heatmaps (4 subplots: cfg_scale1, cfg_scale2, c1, c2)
+                        fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+                        
+                        # CFG Scale 1 heatmap
+                        sns.heatmap(scale1_array, ax=axes[0, 0], cmap='YlOrRd', cbar_kws={'label': 'cfg_scale1'})
+                        axes[0, 0].set_title(f'Sample {batch_start + sample_idx}: CFG Scale 1 (cond1 confidence)')
+                        axes[0, 0].set_xlabel('Token Position')
+                        axes[0, 0].set_ylabel('Generation Step')
+                        
+                        # CFG Scale 2 heatmap
+                        sns.heatmap(scale2_array, ax=axes[0, 1], cmap='YlGnBu', cbar_kws={'label': 'cfg_scale2'})
+                        axes[0, 1].set_title(f'Sample {batch_start + sample_idx}: CFG Scale 2 (cond2 advantage)')
+                        axes[0, 1].set_xlabel('Token Position')
+                        axes[0, 1].set_ylabel('Generation Step')
+                        
+                        # C1 confidence heatmap
+                        sns.heatmap(c1_array, ax=axes[1, 0], cmap='Greens', cbar_kws={'label': 'c1'})
+                        axes[1, 0].set_title(f'Sample {batch_start + sample_idx}: C1 Confidence (cond1)')
+                        axes[1, 0].set_xlabel('Token Position')
+                        axes[1, 0].set_ylabel('Generation Step')
+                        
+                        # C2 confidence heatmap
+                        sns.heatmap(c2_array, ax=axes[1, 1], cmap='Blues', cbar_kws={'label': 'c2'})
+                        axes[1, 1].set_title(f'Sample {batch_start + sample_idx}: C2 Confidence (cond2)')
+                        axes[1, 1].set_xlabel('Token Position')
+                        axes[1, 1].set_ylabel('Generation Step')
+                        
+                        plt.tight_layout()
+                        
+                        # Save heatmap to file (local only, not to wandb)
+                        heatmap_file = os.path.join(heatmap_dir, f"sample_{batch_start + sample_idx}.png")
+                        fig.savefig(heatmap_file, dpi=150, bbox_inches='tight')
+                        plt.close(fig)
+            else:
+                out = result
             
         else:
             raise ValueError(f"Invalid cfg: {cfg}")
@@ -385,7 +501,7 @@ with open(output_file, "w", encoding="utf-8") as log_f:
                 total_correct += 1
                 is_correct = True
             total_processed += 1
-            wandb.log({"accuracy": total_correct/total_processed*100},step=total_processed)
+            wandb.log({"accuracy": total_correct/total_processed*100, "refined_probs": total_correct},step=total_processed)
 
             # Persist per-sample log as JSONL
             record = {
@@ -406,6 +522,8 @@ with open(output_file, "w", encoding="utf-8") as log_f:
                 "cfg_scale": cfg_scale,
                 "cfg_scale1": cfg_scale1,
                 "cfg_scale2": cfg_scale2,
+                "guidance_type": guidance_type,
+                "guidance_step": guidance_step,
                 "prompt": args.prompt,
                 "steps": args.steps,
                 "max_new_tokens": args.max_new_tokens,
