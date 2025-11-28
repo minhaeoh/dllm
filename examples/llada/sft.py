@@ -36,7 +36,7 @@ import dllm
 from dllm.pipelines import llada
 import wandb
 
-data_name = "full_math_gsm8k_filter_all_1_0_1"
+data_name = "math_gsm8k_final"
 max_length = 2056
 
 # wandb.init(project="finetuning", name=f"{data_name}_{max_length}")
@@ -55,7 +55,6 @@ class ModelArguments(dllm.utils.ModelArguments):
 
 @dataclass
 class DataArguments(dllm.utils.DataArguments):
-    # dataset_args: str = "allenai/tulu-3-sft-mixture[train:10000,test:1000]" 
     dataset_args: str = data_name # Use our local GSM8K dataset
     max_length: int = max_length
     truncation: str = "right"  # "right" when using prompt
@@ -76,7 +75,7 @@ class TrainingArguments(dllm.utils.TrainingArguments):
         default=True,
         metadata={"help": "Whether to mask the loss on the prompt tokens"},
     )
-    run_name: str = data_name
+
 
 
 def train():
@@ -134,15 +133,13 @@ def train():
             outputs = super().__call__(features, return_tensors)
             outputs.pop("attention_mask")
             return outputs
-    if dataset.get("train") is None:
-        train_dataset = dataset
-    else:
-        train_dataset = dataset["train"]
+
+
     trainer = llada.LLaDATrainer(
         model=model,
         tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        eval_dataset=None,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset.get("test", None),
         args=training_args,
         data_collator=LLaDASFTCollator(
             tokenizer,

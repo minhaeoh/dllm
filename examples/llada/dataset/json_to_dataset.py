@@ -9,6 +9,6 @@ def json_to_dataset(json_file):
     return datasets.Dataset.from_list(data)
 
 if __name__ == "__main__":
-    json_file = "/data/diffusion/dataset/baselines/testset/gsm8k_llama3.1_8b_instruct_testset.json"
+    json_file = "/data/diffusion/dataset/baselines/testset/math_llama3.1_8b_instruct_testset.json"
     dataset = json_to_dataset(json_file)
-    dataset.save_to_disk("/home/minhae/diffusion/dllm/examples/llada/dataset/testset/gsm8k_llama3.1_8b_instruct")
+    dataset.save_to_disk("/home/minhae/diffusion/dllm/examples/llada/dataset/testset/math_llama3.1_8b_instruct")

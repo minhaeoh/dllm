@@ -38,7 +38,8 @@ class DataArguments:
 class TrainingArguments(transformers.TrainingArguments):
     output_dir: str = "/home/minhae/diffusion/dllm/output"  # overwrite this
     report_to: str = "wandb"
-    run_name: str = "llada-sft"  # wandb run name
+    project: str = "finetuning"
+    run_name: str = "llada-sft"  # overwrite in generate_cfg.py
     overwrite_output_dir: bool = True
     seed: int = 42
     per_device_train_batch_size: int = 1

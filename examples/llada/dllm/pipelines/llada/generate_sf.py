@@ -854,6 +854,7 @@ def generate_two_cfg_adaptive(
     return_dict_in_generate: bool = False,
     stochastic_transfer: bool = False,
     log_cfg_scales: bool = False,  # New parameter to enable cfg_scale logging
+    log_step_text: bool = False,  # New parameter to log intermediate text states
 ) -> torch.Tensor | dict:
     """
     Blockwise diffusion-style masked decoding with 3-condition CFG and adaptive guidance.
@@ -931,6 +932,14 @@ def generate_two_cfg_adaptive(
     cfg_scale2_history = [] if log_cfg_scales else None
     c1_history = [] if log_cfg_scales else None
     c2_history = [] if log_cfg_scales else None
+    
+    # Store intermediate text states (if enabled)
+    step_text_history = [] if log_step_text else None
+    if log_step_text:
+        log_interval = max(1, steps // 10)  # Log ~10 times
+        # steps_to_log = [0,1,2,3,4,5,6,7,8,9]
+        steps_to_log = set(range(0, steps, log_interval))
+        global_step = 0
     
     # Initialize guidance annealing tracking
     if guidance_annealing :
@@ -1035,6 +1044,17 @@ def generate_two_cfg_adaptive(
             
             cfg_gen_logits = uncond_gen_logits + (1 + cfg_scale1) * diff1 + (1 + cfg_scale2) * diff2
             
+            # Store predictions for logging (if this step should be logged)
+            should_log_this_step = log_step_text and global_step in steps_to_log
+            if should_log_this_step:
+                # Get argmax predictions for each condition (save for later logging after infilling)
+                uncond_pred_saved = torch.argmax(uncond_gen_logits, dim=-1)  # [B, max_new_tokens]
+                cond1_pred_saved = torch.argmax(cond1_gen_logits, dim=-1)  # [B, max_new_tokens]
+                cond2_pred_saved = torch.argmax(cond2_gen_logits, dim=-1)  # [B, max_new_tokens]
+            
+            if log_step_text:
+                global_step += 1
+            
             # Free memory
             del diff1, diff2, cfg_scale1, cfg_scale2, cond1_gen_logits, cond2_gen_logits, uncond_gen_logits
             
@@ -1118,6 +1138,26 @@ def generate_two_cfg_adaptive(
                     )[gen_transfer_mask]
                     x_uncond[j, uncond_gen_positions] = cfg_predicted_tokens
             
+            # Log intermediate text states after infilling (if enabled for this step)
+            if should_log_this_step:
+                # Get committed state AFTER infilling (from x_cond2 generation region)
+                committed_state = torch.stack([
+                    x_cond2[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens]
+                    for j in range(B)
+                ], dim=0)  # [B, max_new_tokens]
+                
+                # Decode each for the first sample in batch (to save memory)
+                step_text_data = {
+                    "step": global_step - 1,  # Use the step number from before increment
+                    "uncond_text": tokenizer.decode(uncond_pred_saved[0], skip_special_tokens=False),
+                    "cond1_text": tokenizer.decode(cond1_pred_saved[0], skip_special_tokens=False),
+                    "cond2_text": tokenizer.decode(cond2_pred_saved[0], skip_special_tokens=False),
+                    "committed_text": tokenizer.decode(committed_state[0], skip_special_tokens=False),
+                }
+                step_text_history.append(step_text_data)
+                
+                del uncond_pred_saved, cond1_pred_saved, cond2_pred_saved, committed_state
+            
             # Free memory at end of step
             del x0_cond2, x0_p, confidence, transfer_index_cond2, mask_index_cond2
             torch.cuda.empty_cache()
@@ -1134,10 +1174,12 @@ def generate_two_cfg_adaptive(
             result["cfg_scale2_history"] = cfg_scale2_history  # List of [B, max_new_tokens] tensors
             result["c1_history"] = c1_history  # List of [B, max_new_tokens] tensors
             result["c2_history"] = c2_history  # List of [B, max_new_tokens] tensors
+        if log_step_text:
+            result["step_text_history"] = step_text_history  # List of dicts with text at each logged step
         return result
-
+    
 @torch.no_grad()
-def generate_two_cfg_adaptive_uncond(
+def generate_two_cfg_adaptive_padding(
     model: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizer,
     prompts: list[torch.Tensor],
@@ -1153,31 +1195,35 @@ def generate_two_cfg_adaptive_uncond(
     alpha: float = 2.0,
     beta: float = 1.0,
     guidance_annealing: bool = False,
-    guidance_type: str = "threshold", # "threshold" or "linear"
+    guidance_type: str = "threshold", # "threshold" or "linear" or "cosine"
     guidance_step: float = 0.5,
     epsilon: float = 0.0,
     remasking: str = "random",
     return_dict_in_generate: bool = False,
     stochastic_transfer: bool = False,
     log_cfg_scales: bool = False,  # New parameter to enable cfg_scale logging
+    log_step_text: bool = False,  # New parameter to log intermediate text states
 ) -> torch.Tensor | dict:
     """
     Blockwise diffusion-style masked decoding with 3-condition CFG and adaptive guidance.
+    
+    This version pads cond1 with mask tokens to match cond2 length, but only infillings
+    the generation region (controlled by using cond2_prompt_lens for extraction).
 
     Three conditions:
       - uncond: empty prompt (no context)
-      - cond1: question only
-      - cond2: question + llm_answer
+      - cond1: question only + mask padding (llm_answer length) + mask generation region
+      - cond2: question + llm_answer + mask generation region
     
     CFG formula:
-      cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - uncond)
+      cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - cond1)
     
     Dynamic cfg_scale calculation:
       - cfg_scale1 = c1 * alpha (cond1 confidence-based)
       - cfg_scale2 (with guidance_annealing):
         * Before guidance_step: cfg_scale2 = clamp(beta * c2, max=beta)
         * After guidance_step: cfg_scale2 = clamp(ReLU(c2 - c1), max=beta)
-
+        * Linear guidance: cfg_scale2 = clamp(c2 - c1, max=beta * (1-infilling_progress))
     Args:
         prompts (list[torch.Tensor]):
             Full prompts (question + llm_answer) for each sample.
@@ -1188,7 +1234,365 @@ def generate_two_cfg_adaptive_uncond(
         alpha (float): Multiplier for cond1 confidence (default: 2.0).
         beta (float): Max clamp value for cfg_scale2 (default: 1.0).
         guidance_annealing (bool): If True, apply scheduled guidance annealing.
-        guidance_type (str): "threshold" or "linear" (default: "threshold").
+        guidance_type (str): "threshold" or "linear" or "cosine" (default: "threshold").
+        guidance_step (float): Infilling progress threshold (0.0-1.0) to switch cfg_scale2 formula (default: 0.5).
+        log_cfg_scales (bool): If True, store cfg_scale and confidence values for logging.
+        Other args similar to generate().
+    """
+    assert 1 <= block_length <= max_new_tokens
+    assert 1 <= steps
+
+    mask_id = tokenizer.mask_token_id
+    eos_id = tokenizer.eos_token_id
+
+    B = len(prompts)
+    
+    # ----- Setup cond2 (question + llm_answer) canvas first to get lengths -----
+    cond2_prompt_lens = [p.shape[0] for p in prompts]
+    T_max = max(cond2_prompt_lens) + max_new_tokens
+    
+    x_cond2 = torch.full((B, T_max), eos_id, dtype=torch.long, device=model.device)
+    for i, p in enumerate(prompts):
+        x_cond2[i, :cond2_prompt_lens[i]] = p
+        x_cond2[i, cond2_prompt_lens[i]:cond2_prompt_lens[i] + max_new_tokens] = mask_id
+    
+    # ----- Setup cond1 (question only + mask padding to match cond2 length) canvas -----
+    # cond1: [question, mask_tokens(llm_answer_len), mask_tokens(generation)]
+    # cond2: [question, llm_answer, mask_tokens(generation)]
+    # Only the last max_new_tokens will be infilled (controlled by cond2_prompt_lens)
+    cond1_prompt_lens = q_len  # actual question length (for reference only)
+    
+    x_cond1 = torch.full((B, T_max), eos_id, dtype=torch.long, device=model.device)
+    for i in range(B):
+        # Copy question part
+        x_cond1[i, :cond1_prompt_lens[i]] = prompts[i][:cond1_prompt_lens[i]]
+        # Fill llm_answer portion with mask tokens (for length matching, but won't be infilled)
+        x_cond1[i, cond1_prompt_lens[i]:cond2_prompt_lens[i]] = mask_id
+        # Fill generation region with mask tokens (will be infilled)
+        x_cond1[i, cond2_prompt_lens[i]:cond2_prompt_lens[i] + max_new_tokens] = mask_id
+    
+    # ----- Setup uncond (empty prompt) canvas -----
+    uncond_prompt_lens = [0] * B  # no prompt
+    
+    x_uncond = torch.full((B, T_max), eos_id, dtype=torch.long, device=model.device)
+    for i in range(B):
+        x_uncond[i, :cond2_prompt_lens[i]] = mask_id # won't be infilled
+        x_uncond[i, cond2_prompt_lens[i]:cond2_prompt_lens[i] + max_new_tokens] = mask_id # will be infilled
+
+    # ----- Block scheduling -----
+    num_blocks = math.ceil(max_new_tokens / block_length)
+    steps_per_block = math.ceil(steps / num_blocks)
+    effective_steps_per_block: list[int] = []
+    
+    # Store cfg_scale and confidence values for visualization (if enabled)
+    cfg_scale1_history = [] if log_cfg_scales else None
+    cfg_scale2_history = [] if log_cfg_scales else None
+    c1_history = [] if log_cfg_scales else None
+    c2_history = [] if log_cfg_scales else None
+    
+    # Store intermediate text states (if enabled)
+    step_text_history = [] if log_step_text else None
+    if log_step_text:
+        log_interval = max(1, steps // 10)  # Log ~10 times
+        steps_to_log = set(range(0, steps, log_interval))
+        global_step = 0
+    
+    # Initialize guidance annealing tracking
+    if guidance_annealing :
+        total_initial_masks = 0
+        total_revealed = 0
+        # Calculate total masks across all blocks at the beginning
+        for j in range(B):
+            gen_start = cond2_prompt_lens[j]
+            gen_end = gen_start + max_new_tokens
+            total_initial_masks += (x_cond2[j, gen_start:gen_end] == mask_id).sum().item()
+
+    for b in range(num_blocks):
+        # Build block mask for conditional (they share the same generation region)
+        block_mask_index = torch.zeros((B, block_length), dtype=torch.bool, device=x_cond2.device)
+        
+        for j in range(B):
+            start = cond2_prompt_lens[j] + b * block_length
+            end = min(start + block_length, cond2_prompt_lens[j] + max_new_tokens, T_max)
+            if start < end:
+                width = end - start
+                block_mask_index[j, :width] = (x_cond2[j, start:end] == mask_id)
+
+        num_transfer_tokens = get_num_transfer_tokens(
+            mask_index=block_mask_index,
+            steps=steps_per_block,
+            scheduler=scheduler,
+            stochastic=stochastic_transfer,
+        )
+
+        effective_steps = num_transfer_tokens.size(1)
+        effective_steps_per_block.append(effective_steps)
+
+        # ----- Iterative reveal -----
+        for step_i in range(effective_steps):
+            # Forward pass for all three conditions
+            cond1_logits = model(x_cond1).logits  # [B, T_max, V]
+            cond2_logits = model(x_cond2).logits  # [B, T_max, V]
+            uncond_logits = model(x_uncond).logits  # [B, T_max, V]
+            
+            # Extract generation region logits
+            # Both cond1 and cond2 use cond2_prompt_lens as the generation start point
+            cond1_gen_logits = torch.stack([
+                cond1_logits[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens]
+                for j in range(B)
+            ], dim=0)  # [B, max_new_tokens, V]
+            
+            cond2_gen_logits = torch.stack([
+                cond2_logits[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens]
+                for j in range(B)
+            ], dim=0)  # [B, max_new_tokens, V]
+            
+            uncond_gen_logits = torch.stack([
+                uncond_logits[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens]
+                for j in range(B)
+            ], dim=0)  # [B, max_new_tokens, V]
+            
+            # Apply dynamic CFG on generation region (per-position alpha)
+            # 1) Confidence per position from each branch (max softmax prob)
+            # Memory optimization: compute confidence directly without storing full softmax
+            c1 = torch.softmax(cond1_gen_logits, dim=-1).max(dim=-1)[0]  # [B, max_new_tokens]
+            c2 = torch.softmax(cond2_gen_logits, dim=-1).max(dim=-1)[0]  # [B, max_new_tokens]
+
+            # cfg_scale1: cond1의 confidence가 높을수록 높게 (max=2.0)
+            cfg_scale1 = (c1 * alpha).unsqueeze(-1)  # [B, max_new_tokens, 1]
+
+            # cfg_scale2: guidance annealing 적용
+            if guidance_annealing and guidance_type == "threshold":
+                # Calculate current infilling progress (how much has been revealed)
+                infilling_progress = total_revealed / total_initial_masks if total_initial_masks > 0 else 0.0
+                
+                if infilling_progress < guidance_step:
+                    # Early stage: use simple c2 scaling (더 강한 guidance)
+                    cfg_scale2 = torch.clamp(beta * c2, max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+                else:
+                    # Later stage: use ReLU(c2 - c1) (더 selective한 guidance)
+                    cfg_scale2 = torch.clamp(torch.relu(c2 - (c1 + epsilon)), max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+            elif guidance_annealing and guidance_type == "linear":
+                infilling_progress = total_revealed / total_initial_masks if total_initial_masks > 0 else 0.0
+                max_beta = beta * (1-infilling_progress)
+                # Linear guidance: cfg_scale2 = clamp(c2 - c1, max=beta)
+                cfg_scale2 = torch.clamp(c2 - c1, max=max_beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+            elif guidance_annealing and guidance_type == "cosine":
+                infilling_progress = total_revealed / total_initial_masks if total_initial_masks > 0 else 0.0
+                max_beta = beta /2 * (1 + math.cos(math.pi * infilling_progress))
+                # Cosine guidance: cfg_scale2 = clamp(cos(c2 - c1), max=beta)
+                cfg_scale2 = torch.clamp(torch.cos(c2 - c1), max=max_beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+            else:
+                # Default: cond2가 cond1보다 높을 때만 영향, 차이에 비례 (max=beta)
+                cfg_scale2 = torch.clamp(torch.relu(c2 - (c1 + epsilon)), max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+            
+            # Store cfg_scale and confidence values for logging (before unsqueeze, store 2D version)
+            if log_cfg_scales:
+                cfg_scale1_history.append(cfg_scale1.squeeze(-1).detach().cpu())  # [B, max_new_tokens]
+                cfg_scale2_history.append(cfg_scale2.squeeze(-1).detach().cpu())  # [B, max_new_tokens]
+                c1_history.append(c1.detach().cpu())  # [B, max_new_tokens]
+                c2_history.append(c2.detach().cpu())  # [B, max_new_tokens]
+            
+            # Free memory
+            del c1, c2
+
+            # Apply 3-condition CFG on generation region
+            # cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - cond1)
+            # Memory-efficient computation
+            diff1 = cond1_gen_logits - uncond_gen_logits
+            diff2 = cond2_gen_logits - cond1_gen_logits
+            
+            cfg_gen_logits = uncond_gen_logits + (1 + cfg_scale1) * diff1 + (1 + cfg_scale2) * diff2
+            
+            # Store predictions for logging (if this step should be logged)
+            should_log_this_step = log_step_text and global_step in steps_to_log
+            if should_log_this_step:
+                # Get argmax predictions for each condition (save for later logging after infilling)
+                uncond_pred_saved = torch.argmax(uncond_gen_logits, dim=-1)  # [B, max_new_tokens]
+                cond1_pred_saved = torch.argmax(cond1_gen_logits, dim=-1)  # [B, max_new_tokens]
+                cond2_pred_saved = torch.argmax(cond2_gen_logits, dim=-1)  # [B, max_new_tokens]
+            
+            if log_step_text:
+                global_step += 1
+            
+            # Free memory
+            del diff1, diff2, cfg_scale1, cfg_scale2, cond1_gen_logits, cond2_gen_logits, uncond_gen_logits
+            
+            # Reconstruct full logits for all canvases (in-place when possible)
+            cond2_final_logits = cond2_logits
+            for j in range(B):
+                cond2_final_logits[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens] = cfg_gen_logits[j]
+            
+            # Free memory
+            del cond1_logits, uncond_logits
+
+            # Argmax decoding with optional Gumbel noise on CFG-combined logits
+            # Only need cond2 for this function
+            cond2_logits_with_noise = add_gumbel_noise(cond2_final_logits, temperature=temperature)
+            x0_cond2 = torch.argmax(cond2_logits_with_noise, dim=-1)  # [B, T_cond2]
+            
+            # Free memory
+            del cond2_logits_with_noise
+
+            # Compute confidence for remasking (based on CFG logits, use cond2 as reference)
+            if remasking == "low_confidence":
+                p = F.softmax(cond2_final_logits, dim=-1)
+                x0_p = torch.gather(p, dim=-1, index=x0_cond2.unsqueeze(-1)).squeeze(-1)
+                del p
+            elif remasking == "random":
+                x0_p = torch.rand_like(x0_cond2, dtype=torch.float32)
+            else:
+                raise NotImplementedError(remasking)
+
+            # Free memory
+            del cond2_final_logits, cfg_gen_logits
+
+            # Restrict to current block
+            mask_index_cond2 = x_cond2 == mask_id
+            for j in range(B):
+                x0_p[j, cond2_prompt_lens[j] + (b + 1) * block_length:] = -np.inf
+
+            # Only update masked positions
+            x0_cond2 = torch.where(mask_index_cond2, x0_cond2, x_cond2)
+            confidence = torch.where(mask_index_cond2, x0_p, -np.inf)
+
+            # Select top-k positions to commit
+            transfer_index_cond2 = torch.zeros_like(x0_cond2, dtype=torch.bool)
+            for j in range(B):
+                k = int(num_transfer_tokens[j, step_i].item())
+                if k > 0:
+                    _, select_index = torch.topk(confidence[j], k=k)
+                    transfer_index_cond2[j, select_index] = True
+
+            # Commit CFG predictions to cond2 canvas (question + llm_answer)
+            x_cond2[transfer_index_cond2] = x0_cond2[transfer_index_cond2]
+            
+            # Update total_revealed count for guidance annealing
+            if guidance_annealing:
+                total_revealed += transfer_index_cond2.sum().item()
+            
+            # Sync cond1 and uncond canvases with same tokens
+            for j in range(B):
+                # Both cond1 and cond2 use the same generation start point (cond2_prompt_lens)
+                cond1_gen_start = cond2_prompt_lens[j]
+                cond2_gen_start = cond2_prompt_lens[j]
+                uncond_gen_start = cond2_prompt_lens[j]
+                
+                gen_transfer_mask = transfer_index_cond2[j, cond2_gen_start:cond2_gen_start + max_new_tokens]
+                
+                if gen_transfer_mask.any():
+                    cfg_predicted_tokens = x0_cond2[j, cond2_gen_start:cond2_gen_start + max_new_tokens][gen_transfer_mask]
+                    
+                    # Update cond1 (at the same position as cond2)
+                    cond1_gen_positions = torch.arange(
+                        cond1_gen_start, 
+                        cond1_gen_start + max_new_tokens, 
+                        device=x_cond1.device
+                    )[gen_transfer_mask]
+                    x_cond1[j, cond1_gen_positions] = cfg_predicted_tokens
+                    
+                    # Update uncond
+                    uncond_gen_positions = torch.arange(
+                        uncond_gen_start,
+                        uncond_gen_start + max_new_tokens,
+                        device=x_uncond.device
+                    )[gen_transfer_mask]
+                    x_uncond[j, uncond_gen_positions] = cfg_predicted_tokens
+            
+            # Log intermediate text states after infilling (if enabled for this step)
+            if should_log_this_step:
+                # Get committed state AFTER infilling (from x_cond2 generation region)
+                committed_state = torch.stack([
+                    x_cond2[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens]
+                    for j in range(B)
+                ], dim=0)  # [B, max_new_tokens]
+                
+                # Decode each for the first sample in batch (to save memory)
+                step_text_data = {
+                    "step": global_step - 1,  # Use the step number from before increment
+                    "uncond_text": tokenizer.decode(uncond_pred_saved[0], skip_special_tokens=False),
+                    "cond1_text": tokenizer.decode(cond1_pred_saved[0], skip_special_tokens=False),
+                    "cond2_text": tokenizer.decode(cond2_pred_saved[0], skip_special_tokens=False),
+                    "committed_text": tokenizer.decode(committed_state[0], skip_special_tokens=False),
+                }
+                step_text_history.append(step_text_data)
+                
+                del uncond_pred_saved, cond1_pred_saved, cond2_pred_saved, committed_state
+            
+            # Free memory at end of step
+            del x0_cond2, x0_p, confidence, transfer_index_cond2, mask_index_cond2
+            torch.cuda.empty_cache()
+
+    if not return_dict_in_generate:
+        return x_cond2
+    else:
+        result = {
+            "effective_steps_per_block": effective_steps_per_block,
+            "sequences": x_cond2,
+        }
+        if log_cfg_scales:
+            result["cfg_scale1_history"] = cfg_scale1_history  # List of [B, max_new_tokens] tensors
+            result["cfg_scale2_history"] = cfg_scale2_history  # List of [B, max_new_tokens] tensors
+            result["c1_history"] = c1_history  # List of [B, max_new_tokens] tensors
+            result["c2_history"] = c2_history  # List of [B, max_new_tokens] tensors
+        if log_step_text:
+            result["step_text_history"] = step_text_history  # List of dicts with text at each logged step
+        return result
+
+@torch.no_grad()
+def generate_two_cfg_adaptive_blockwise(
+    model: transformers.PreTrainedModel,
+    tokenizer: transformers.PreTrainedTokenizer,
+    prompts: list[torch.Tensor],
+    q_len: list[int],
+    scheduler: BaseAlphaScheduler = LinearAlphaScheduler(),
+    steps: int = 128,
+    max_new_tokens: int = 256,
+    max_length: int = 1024,
+    block_length: int = 128,
+    temperature: float = 0.0,
+    cfg_scale1: float | None = None,
+    cfg_scale2: float | None = None,
+    alpha: float = 2.0,
+    beta: float = 1.0,
+    guidance_annealing: bool = False,
+    guidance_type: str = "threshold", # "threshold" or "linear" or "cosine"
+    guidance_step: float = 0.5,
+    epsilon: float = 0.0,
+    remasking: str = "random",
+    return_dict_in_generate: bool = False,
+    stochastic_transfer: bool = False,
+    log_cfg_scales: bool = False,  # New parameter to enable cfg_scale logging
+    log_step_text: bool = False,  # New parameter to log intermediate text states
+) -> torch.Tensor | dict:
+    """
+    Blockwise diffusion-style masked decoding with 3-condition CFG and adaptive guidance.
+
+    Three conditions:
+      - uncond: empty prompt (no context)
+      - cond1: question only
+      - cond2: question + llm_answer
+    
+    CFG formula:
+      cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - cond1)
+    
+    Dynamic cfg_scale calculation:
+      - cfg_scale1 = c1 * alpha (cond1 confidence-based)
+      - cfg_scale2 (with guidance_annealing):
+        * Before guidance_step: cfg_scale2 = clamp(beta * c2, max=beta)
+        * After guidance_step: cfg_scale2 = clamp(ReLU(c2 - c1), max=beta)
+        * Linear guidance: cfg_scale2 = clamp(c2 - c1, max=beta * (1-infilling_progress))
+    Args:
+        prompts (list[torch.Tensor]):
+            Full prompts (question + llm_answer) for each sample.
+        q_len (list[int]):
+            Length of question-only part for each sample.
+        cfg_scale1 (float): Ignored; dynamically computed from c1 * alpha.
+        cfg_scale2 (float): Ignored; dynamically computed based on guidance_annealing.
+        alpha (float): Multiplier for cond1 confidence (default: 2.0).
+        beta (float): Max clamp value for cfg_scale2 (default: 1.0).
+        guidance_annealing (bool): If True, apply scheduled guidance annealing.
+        guidance_type (str): "threshold" or "linear" or "cosine" (default: "threshold").
         guidance_step (float): Infilling progress threshold (0.0-1.0) to switch cfg_scale2 formula (default: 0.5).
         log_cfg_scales (bool): If True, store cfg_scale and confidence values for logging.
         Other args similar to generate().
@@ -1238,8 +1642,15 @@ def generate_two_cfg_adaptive_uncond(
     c1_history = [] if log_cfg_scales else None
     c2_history = [] if log_cfg_scales else None
     
+    # Store intermediate text states (if enabled)
+    step_text_history = [] if log_step_text else None
+    if log_step_text:
+        log_interval = max(1, steps // 10)  # Log ~10 times
+        steps_to_log = set(range(0, steps, log_interval))
+        global_step = 0
+    
     # Initialize guidance annealing tracking
-    if guidance_annealing and guidance_type == "threshold":
+    if guidance_annealing :
         total_initial_masks = 0
         total_revealed = 0
         # Calculate total masks across all blocks at the beginning
@@ -1292,11 +1703,11 @@ def generate_two_cfg_adaptive_uncond(
             # Apply dynamic CFG on generation region (per-position alpha)
             # 1) Confidence per position from each branch (max softmax prob)
             # Memory optimization: compute confidence directly without storing full softmax
-            c1 = torch.softmax(cond1_gen_logits, dim=-1).max(dim=-1)[0]  # [B, max_new_tokens]
-            c2 = torch.softmax(cond2_gen_logits, dim=-1).max(dim=-1)[0]  # [B, max_new_tokens]
+            c1 = torch.softmax(cond1_gen_logits, dim=-1).max(dim=-1)[0].mean(dim=-1)  # [B]
+            c2 = torch.softmax(cond2_gen_logits, dim=-1).max(dim=-1)[0].mean(dim=-1)  # [B]
 
             # cfg_scale1: cond1의 confidence가 높을수록 높게 (max=2.0)
-            cfg_scale1 = (c1 * alpha).unsqueeze(-1)  # [B, max_new_tokens, 1]
+            cfg_scale1 = (c1 * alpha).unsqueeze(-1).repeat(1, max_new_tokens).unsqueeze(-1) # [B, max_new_tokens, 1]
 
             # cfg_scale2: guidance annealing 적용
             if guidance_annealing and guidance_type == "threshold":
@@ -1305,36 +1716,54 @@ def generate_two_cfg_adaptive_uncond(
                 
                 if infilling_progress < guidance_step:
                     # Early stage: use simple c2 scaling (더 강한 guidance)
-                    cfg_scale2 = torch.clamp(beta * c2, max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+                    cfg_scale2 = torch.clamp(beta * c2, max=beta)  # [B]
                 else:
                     # Later stage: use ReLU(c2 - c1) (더 selective한 guidance)
-                    cfg_scale2 = torch.clamp(torch.relu(c2 - (c1 + epsilon)), max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+                    cfg_scale2 = torch.clamp(torch.relu(c2 - (c1 + epsilon)), max=beta)  # [B]
             elif guidance_annealing and guidance_type == "linear":
                 infilling_progress = total_revealed / total_initial_masks if total_initial_masks > 0 else 0.0
                 max_beta = beta * (1-infilling_progress)
                 # Linear guidance: cfg_scale2 = clamp(c2 - c1, max=beta)
-                cfg_scale2 = torch.clamp(c2 - c1, max=max_beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+                cfg_scale2 = torch.clamp(c2 - c1, max=max_beta)  # [B]
+            elif guidance_annealing and guidance_type == "cosine":
+                infilling_progress = total_revealed / total_initial_masks if total_initial_masks > 0 else 0.0
+                max_beta = beta /2 * (1 + math.cos(math.pi * infilling_progress))
+                # Cosine guidance: cfg_scale2 = clamp(c2 - c1, max=beta)
+                cfg_scale2 = torch.clamp(c2 - c1, max=max_beta)  # [B]
             else:
                 # Default: cond2가 cond1보다 높을 때만 영향, 차이에 비례 (max=beta)
-                cfg_scale2 = torch.clamp(torch.relu(c2 - (c1 + epsilon)), max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+                cfg_scale2 = torch.clamp(torch.relu(c2 - (c1 + epsilon)), max=beta)  # [B]
+            cfg_scale2 = cfg_scale2.unsqueeze(-1).repeat(1, max_new_tokens).unsqueeze(-1) # [B, max_new_tokens, 1]
             
-            # Store cfg_scale and confidence values for logging (before unsqueeze, store 2D version)
+            # Store cfg_scale and confidence values for logging
             if log_cfg_scales:
                 cfg_scale1_history.append(cfg_scale1.squeeze(-1).detach().cpu())  # [B, max_new_tokens]
                 cfg_scale2_history.append(cfg_scale2.squeeze(-1).detach().cpu())  # [B, max_new_tokens]
-                c1_history.append(c1.detach().cpu())  # [B, max_new_tokens]
-                c2_history.append(c2.detach().cpu())  # [B, max_new_tokens]
+                # Expand c1, c2 to match cfg_scale shape for consistency
+                c1_history.append(c1.unsqueeze(-1).repeat(1, max_new_tokens).detach().cpu())  # [B, max_new_tokens]
+                c2_history.append(c2.unsqueeze(-1).repeat(1, max_new_tokens).detach().cpu())  # [B, max_new_tokens]
             
             # Free memory
             del c1, c2
 
             # Apply 3-condition CFG on generation region
-            # cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - uncond)
+            # cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - cond1)
             # Memory-efficient computation
             diff1 = cond1_gen_logits - uncond_gen_logits
-            diff2 = cond2_gen_logits - uncond_gen_logits
+            diff2 = cond2_gen_logits - cond1_gen_logits
             
             cfg_gen_logits = uncond_gen_logits + (1 + cfg_scale1) * diff1 + (1 + cfg_scale2) * diff2
+            
+            # Store predictions for logging (if this step should be logged)
+            should_log_this_step = log_step_text and global_step in steps_to_log
+            if should_log_this_step:
+                # Get argmax predictions for each condition (save for later logging after infilling)
+                uncond_pred_saved = torch.argmax(uncond_gen_logits, dim=-1)  # [B, max_new_tokens]
+                cond1_pred_saved = torch.argmax(cond1_gen_logits, dim=-1)  # [B, max_new_tokens]
+                cond2_pred_saved = torch.argmax(cond2_gen_logits, dim=-1)  # [B, max_new_tokens]
+            
+            if log_step_text:
+                global_step += 1
             
             # Free memory
             del diff1, diff2, cfg_scale1, cfg_scale2, cond1_gen_logits, cond2_gen_logits, uncond_gen_logits
@@ -1419,6 +1848,26 @@ def generate_two_cfg_adaptive_uncond(
                     )[gen_transfer_mask]
                     x_uncond[j, uncond_gen_positions] = cfg_predicted_tokens
             
+            # Log intermediate text states after infilling (if enabled for this step)
+            if should_log_this_step:
+                # Get committed state AFTER infilling (from x_cond2 generation region)
+                committed_state = torch.stack([
+                    x_cond2[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens]
+                    for j in range(B)
+                ], dim=0)  # [B, max_new_tokens]
+                
+                # Decode each for the first sample in batch (to save memory)
+                step_text_data = {
+                    "step": global_step - 1,  # Use the step number from before increment
+                    "uncond_text": tokenizer.decode(uncond_pred_saved[0], skip_special_tokens=False),
+                    "cond1_text": tokenizer.decode(cond1_pred_saved[0], skip_special_tokens=False),
+                    "cond2_text": tokenizer.decode(cond2_pred_saved[0], skip_special_tokens=False),
+                    "committed_text": tokenizer.decode(committed_state[0], skip_special_tokens=False),
+                }
+                step_text_history.append(step_text_data)
+                
+                del uncond_pred_saved, cond1_pred_saved, cond2_pred_saved, committed_state
+            
             # Free memory at end of step
             del x0_cond2, x0_p, confidence, transfer_index_cond2, mask_index_cond2
             torch.cuda.empty_cache()
@@ -1435,7 +1884,311 @@ def generate_two_cfg_adaptive_uncond(
             result["cfg_scale2_history"] = cfg_scale2_history  # List of [B, max_new_tokens] tensors
             result["c1_history"] = c1_history  # List of [B, max_new_tokens] tensors
             result["c2_history"] = c2_history  # List of [B, max_new_tokens] tensors
+        if log_step_text:
+            result["step_text_history"] = step_text_history  # List of dicts with text at each logged step
         return result
+    
+    
+# @torch.no_grad()
+# def generate_two_cfg_adaptive_uncond(
+#     model: transformers.PreTrainedModel,
+#     tokenizer: transformers.PreTrainedTokenizer,
+#     prompts: list[torch.Tensor],
+#     q_len: list[int],
+#     scheduler: BaseAlphaScheduler = LinearAlphaScheduler(),
+#     steps: int = 128,
+#     max_new_tokens: int = 256,
+#     max_length: int = 1024,
+#     block_length: int = 128,
+#     temperature: float = 0.0,
+#     cfg_scale1: float | None = None,
+#     cfg_scale2: float | None = None,
+#     alpha: float = 2.0,
+#     beta: float = 1.0,
+#     guidance_annealing: bool = False,
+#     guidance_type: str = "threshold", # "threshold" or "linear"
+#     guidance_step: float = 0.5,
+#     epsilon: float = 0.0,
+#     remasking: str = "random",
+#     return_dict_in_generate: bool = False,
+#     stochastic_transfer: bool = False,
+#     log_cfg_scales: bool = False,  # New parameter to enable cfg_scale logging
+# ) -> torch.Tensor | dict:
+#     """
+#     Blockwise diffusion-style masked decoding with 3-condition CFG and adaptive guidance.
+
+#     Three conditions:
+#       - uncond: empty prompt (no context)
+#       - cond1: question only
+#       - cond2: question + llm_answer
+    
+#     CFG formula:
+#       cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - uncond)
+    
+#     Dynamic cfg_scale calculation:
+#       - cfg_scale1 = c1 * alpha (cond1 confidence-based)
+#       - cfg_scale2 (with guidance_annealing):
+#         * Before guidance_step: cfg_scale2 = clamp(beta * c2, max=beta)
+#         * After guidance_step: cfg_scale2 = clamp(ReLU(c2 - c1), max=beta)
+
+#     Args:
+#         prompts (list[torch.Tensor]):
+#             Full prompts (question + llm_answer) for each sample.
+#         q_len (list[int]):
+#             Length of question-only part for each sample.
+#         cfg_scale1 (float): Ignored; dynamically computed from c1 * alpha.
+#         cfg_scale2 (float): Ignored; dynamically computed based on guidance_annealing.
+#         alpha (float): Multiplier for cond1 confidence (default: 2.0).
+#         beta (float): Max clamp value for cfg_scale2 (default: 1.0).
+#         guidance_annealing (bool): If True, apply scheduled guidance annealing.
+#         guidance_type (str): "threshold" or "linear" (default: "threshold").
+#         guidance_step (float): Infilling progress threshold (0.0-1.0) to switch cfg_scale2 formula (default: 0.5).
+#         log_cfg_scales (bool): If True, store cfg_scale and confidence values for logging.
+#         Other args similar to generate().
+#     """
+#     assert 1 <= block_length <= max_new_tokens
+#     assert 1 <= steps
+
+#     mask_id = tokenizer.mask_token_id
+#     eos_id = tokenizer.eos_token_id
+
+#     B = len(prompts)
+    
+#     # ----- Setup cond1 (question only) canvas -----
+#     cond1_prompt_lens = q_len
+#     T_cond1 = max(cond1_prompt_lens) + max_new_tokens
+    
+#     x_cond1 = torch.full((B, T_cond1), eos_id, dtype=torch.long, device=model.device)
+#     for i in range(B):
+#         x_cond1[i, :cond1_prompt_lens[i]] = prompts[i][:cond1_prompt_lens[i]]
+#         x_cond1[i, cond1_prompt_lens[i]:cond1_prompt_lens[i] + max_new_tokens] = mask_id
+    
+#     # ----- Setup cond2 (question + llm_answer) canvas -----
+#     cond2_prompt_lens = [p.shape[0] for p in prompts]
+#     T_cond2 = max(cond2_prompt_lens) + max_new_tokens
+    
+#     x_cond2 = torch.full((B, T_cond2), eos_id, dtype=torch.long, device=model.device)
+#     for i, p in enumerate(prompts):
+#         x_cond2[i, :cond2_prompt_lens[i]] = p
+#         x_cond2[i, cond2_prompt_lens[i]:cond2_prompt_lens[i] + max_new_tokens] = mask_id
+    
+#     # ----- Setup uncond (empty prompt) canvas -----
+#     uncond_prompt_lens = [0] * B  # no prompt
+#     T_uncond = max_new_tokens
+    
+#     x_uncond = torch.full((B, T_uncond), eos_id, dtype=torch.long, device=model.device)
+#     for i in range(B):
+#         x_uncond[i, :max_new_tokens] = mask_id
+
+#     # ----- Block scheduling -----
+#     num_blocks = math.ceil(max_new_tokens / block_length)
+#     steps_per_block = math.ceil(steps / num_blocks)
+#     effective_steps_per_block: list[int] = []
+    
+#     # Store cfg_scale and confidence values for visualization (if enabled)
+#     cfg_scale1_history = [] if log_cfg_scales else None
+#     cfg_scale2_history = [] if log_cfg_scales else None
+#     c1_history = [] if log_cfg_scales else None
+#     c2_history = [] if log_cfg_scales else None
+    
+#     # Initialize guidance annealing tracking
+#     if guidance_annealing:
+#         total_initial_masks = 0
+#         total_revealed = 0
+#         # Calculate total masks across all blocks at the beginning
+#         for j in range(B):
+#             gen_start = cond2_prompt_lens[j]
+#             gen_end = gen_start + max_new_tokens
+#             total_initial_masks += (x_cond2[j, gen_start:gen_end] == mask_id).sum().item()
+
+#     for b in range(num_blocks):
+#         # Build block mask for conditional (they share the same generation region)
+#         block_mask_index = torch.zeros((B, block_length), dtype=torch.bool, device=x_cond2.device)
+        
+#         for j in range(B):
+#             start = cond2_prompt_lens[j] + b * block_length
+#             end = min(start + block_length, cond2_prompt_lens[j] + max_new_tokens, T_cond2)
+#             if start < end:
+#                 width = end - start
+#                 block_mask_index[j, :width] = (x_cond2[j, start:end] == mask_id)
+
+#         num_transfer_tokens = get_num_transfer_tokens(
+#             mask_index=block_mask_index,
+#             steps=steps_per_block,
+#             scheduler=scheduler,
+#             stochastic=stochastic_transfer,
+#         )
+
+#         effective_steps = num_transfer_tokens.size(1)
+#         effective_steps_per_block.append(effective_steps)
+
+#         # ----- Iterative reveal -----
+#         for step_i in range(effective_steps):
+#             # Forward pass for all three conditions
+#             cond1_logits = model(x_cond1).logits  # [B, T_cond1, V]
+#             cond2_logits = model(x_cond2).logits  # [B, T_cond2, V]
+#             uncond_logits = model(x_uncond).logits  # [B, T_uncond, V]
+            
+#             # Extract generation region logits (all have same max_new_tokens)
+#             cond1_gen_logits = torch.stack([
+#                 cond1_logits[j, cond1_prompt_lens[j]:cond1_prompt_lens[j] + max_new_tokens]
+#                 for j in range(B)
+#             ], dim=0)  # [B, max_new_tokens, V]
+            
+#             cond2_gen_logits = torch.stack([
+#                 cond2_logits[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens]
+#                 for j in range(B)
+#             ], dim=0)  # [B, max_new_tokens, V]
+            
+#             uncond_gen_logits = uncond_logits[:, :max_new_tokens, :]  # [B, max_new_tokens, V]
+            
+#             # Apply dynamic CFG on generation region (per-position alpha)
+#             # 1) Confidence per position from each branch (max softmax prob)
+#             # Memory optimization: compute confidence directly without storing full softmax
+#             c1 = torch.softmax(cond1_gen_logits, dim=-1).max(dim=-1)[0]  # [B, max_new_tokens]
+#             c2 = torch.softmax(cond2_gen_logits, dim=-1).max(dim=-1)[0]  # [B, max_new_tokens]
+
+#             # cfg_scale1: cond1의 confidence가 높을수록 높게 (max=2.0)
+#             cfg_scale1 = (c1 * alpha).unsqueeze(-1)  # [B, max_new_tokens, 1]
+
+#             # cfg_scale2: guidance annealing 적용
+#             if guidance_annealing and guidance_type == "threshold":
+#                 # Calculate current infilling progress (how much has been revealed)
+#                 infilling_progress = total_revealed / total_initial_masks if total_initial_masks > 0 else 0.0
+                
+#                 if infilling_progress < guidance_step:
+#                     # Early stage: use simple c2 scaling (더 강한 guidance)
+#                     cfg_scale2 = torch.clamp(beta * c2, max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+#                 else:
+#                     # Later stage: use ReLU(c2 - c1) (더 selective한 guidance)
+#                     cfg_scale2 = torch.clamp(torch.relu(c2 - (c1 + epsilon)), max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+#             elif guidance_annealing and guidance_type == "linear":
+#                 infilling_progress = total_revealed / total_initial_masks if total_initial_masks > 0 else 0.0
+#                 max_beta = beta * (1-infilling_progress)
+#                 # Linear guidance: cfg_scale2 = clamp(c2 - c1, max=beta)
+#                 cfg_scale2 = torch.clamp(c2 - c1, max=max_beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+#             else:
+#                 # Default: cond2가 cond1보다 높을 때만 영향, 차이에 비례 (max=beta)
+#                 cfg_scale2 = torch.clamp(torch.relu(c2 - (c1 + epsilon)), max=beta).unsqueeze(-1)  # [B, max_new_tokens, 1]
+            
+#             # Store cfg_scale and confidence values for logging (before unsqueeze, store 2D version)
+#             if log_cfg_scales:
+#                 cfg_scale1_history.append(cfg_scale1.squeeze(-1).detach().cpu())  # [B, max_new_tokens]
+#                 cfg_scale2_history.append(cfg_scale2.squeeze(-1).detach().cpu())  # [B, max_new_tokens]
+#                 c1_history.append(c1.detach().cpu())  # [B, max_new_tokens]
+#                 c2_history.append(c2.detach().cpu())  # [B, max_new_tokens]
+            
+#             # Free memory
+#             del c1, c2
+
+#             # Apply 3-condition CFG on generation region
+#             # cfg_gen_logits = uncond + cfg_scale1 * (cond1 - uncond) + cfg_scale2 * (cond2 - uncond)
+#             # Memory-efficient computation
+#             diff1 = cond1_gen_logits - uncond_gen_logits
+#             diff2 = cond2_gen_logits - uncond_gen_logits
+            
+#             cfg_gen_logits = uncond_gen_logits + (1 + cfg_scale1) * diff1 + (1 + cfg_scale2) * diff2
+            
+#             # Free memory
+#             del diff1, diff2, cfg_scale1, cfg_scale2, cond1_gen_logits, cond2_gen_logits, uncond_gen_logits
+            
+#             # Reconstruct full logits for all canvases (in-place when possible)
+#             cond2_final_logits = cond2_logits
+#             for j in range(B):
+#                 cond2_final_logits[j, cond2_prompt_lens[j]:cond2_prompt_lens[j] + max_new_tokens] = cfg_gen_logits[j]
+            
+#             # Free memory
+#             del cond1_logits, uncond_logits
+
+#             # Argmax decoding with optional Gumbel noise on CFG-combined logits
+#             # Only need cond2 for this function
+#             cond2_logits_with_noise = add_gumbel_noise(cond2_final_logits, temperature=temperature)
+#             x0_cond2 = torch.argmax(cond2_logits_with_noise, dim=-1)  # [B, T_cond2]
+            
+#             # Free memory
+#             del cond2_logits_with_noise
+
+#             # Compute confidence for remasking (based on CFG logits, use cond2 as reference)
+#             if remasking == "low_confidence":
+#                 p = F.softmax(cond2_final_logits, dim=-1)
+#                 x0_p = torch.gather(p, dim=-1, index=x0_cond2.unsqueeze(-1)).squeeze(-1)
+#                 del p
+#             elif remasking == "random":
+#                 x0_p = torch.rand_like(x0_cond2, dtype=torch.float32)
+#             else:
+#                 raise NotImplementedError(remasking)
+
+#             # Free memory
+#             del cond2_final_logits, cfg_gen_logits
+
+#             # Restrict to current block
+#             mask_index_cond2 = x_cond2 == mask_id
+#             for j in range(B):
+#                 x0_p[j, cond2_prompt_lens[j] + (b + 1) * block_length:] = -np.inf
+
+#             # Only update masked positions
+#             x0_cond2 = torch.where(mask_index_cond2, x0_cond2, x_cond2)
+#             confidence = torch.where(mask_index_cond2, x0_p, -np.inf)
+
+#             # Select top-k positions to commit
+#             transfer_index_cond2 = torch.zeros_like(x0_cond2, dtype=torch.bool)
+#             for j in range(B):
+#                 k = int(num_transfer_tokens[j, step_i].item())
+#                 if k > 0:
+#                     _, select_index = torch.topk(confidence[j], k=k)
+#                     transfer_index_cond2[j, select_index] = True
+
+#             # Commit CFG predictions to cond2 canvas (question + llm_answer)
+#             x_cond2[transfer_index_cond2] = x0_cond2[transfer_index_cond2]
+            
+#             # Update total_revealed count for guidance annealing
+#             if guidance_annealing:
+#                 total_revealed += transfer_index_cond2.sum().item()
+            
+#             # Sync cond1 and uncond canvases with same tokens
+#             for j in range(B):
+#                 cond1_gen_start = cond1_prompt_lens[j]
+#                 cond2_gen_start = cond2_prompt_lens[j]
+#                 uncond_gen_start = 0
+                
+#                 gen_transfer_mask = transfer_index_cond2[j, cond2_gen_start:cond2_gen_start + max_new_tokens]
+                
+#                 if gen_transfer_mask.any():
+#                     cfg_predicted_tokens = x0_cond2[j, cond2_gen_start:cond2_gen_start + max_new_tokens][gen_transfer_mask]
+                    
+#                     # Update cond1
+#                     cond1_gen_positions = torch.arange(
+#                         cond1_gen_start, 
+#                         cond1_gen_start + max_new_tokens, 
+#                         device=x_cond1.device
+#                     )[gen_transfer_mask]
+#                     x_cond1[j, cond1_gen_positions] = cfg_predicted_tokens
+                    
+#                     # Update uncond
+#                     uncond_gen_positions = torch.arange(
+#                         uncond_gen_start,
+#                         uncond_gen_start + max_new_tokens,
+#                         device=x_uncond.device
+#                     )[gen_transfer_mask]
+#                     x_uncond[j, uncond_gen_positions] = cfg_predicted_tokens
+            
+#             # Free memory at end of step
+#             del x0_cond2, x0_p, confidence, transfer_index_cond2, mask_index_cond2
+#             torch.cuda.empty_cache()
+
+#     if not return_dict_in_generate:
+#         return x_cond2
+#     else:
+#         result = {
+#             "effective_steps_per_block": effective_steps_per_block,
+#             "sequences": x_cond2,
+#         }
+#         if log_cfg_scales:
+#             result["cfg_scale1_history"] = cfg_scale1_history  # List of [B, max_new_tokens] tensors
+#             result["cfg_scale2_history"] = cfg_scale2_history  # List of [B, max_new_tokens] tensors
+#             result["c1_history"] = c1_history  # List of [B, max_new_tokens] tensors
+#             result["c2_history"] = c2_history  # List of [B, max_new_tokens] tensors
+#         return result
 
 
 @torch.no_grad()

@@ -28,16 +28,19 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import random
 from datasets import load_from_disk
+from dataset.math_scorer import MATHScorer
+
+math_scorer = MATHScorer
 
 @dataclass
 class AllArguments:
     """Combined arguments for data and script"""
     # Data arguments
-    dataset_args: str = "/home/minhae/diffusion/dllm/examples/llada/dataset/testset/gsm8k_llama3.1_8b_instruct"
+    dataset_args: str = "/home/minhae/diffusion/dllm/examples/llada/dataset/testset/math_llama3.1_8b_instruct"
     num_proc: int = 8
     
     # Script arguments
-    task : str = "gsm8k-filtered"
+    task : str = "math-filtered"
     model_name: str = "Instruct-SFT-middle"
     model_path: str = "/home/minhae/diffusion/dllm/models_nlp/LLaDA-8B-Instruct-SFT/math_gsm8k_filter_all_1_0_1_ml2056/checkpoint-335746"
     # model_name: str = "LLaDA-8B-Instruct"
@@ -146,7 +149,7 @@ if args.cfg == 3 and args.log_cfg_scales:
     heatmap_dir = os.path.join(output_dir, f"heatmaps_{timestamp}")
     os.makedirs(heatmap_dir, exist_ok=True)
 
-wandb.init(project="evaluation-gsm8k-filtered", name=f"{args.model_name}_{config_str}_{timestamp}")
+wandb.init(project="evaluation-math-filtered", name=f"{args.model_name}_{config_str}_{timestamp}")
 wandb.config.update({
     "model": args.model_name,
     "config": config_str,
@@ -231,7 +234,7 @@ def custom_apply_chat_template(row, prompt: bool):
         tokenize=True,
         return_tensors="pt",
     )[0].tolist()
-    return {"q_llm_input_ids": q_llm_input_ids, "q_input_ids": q_input_ids, "q_len": len(q_input_ids), "gold_answer": row["gold_answer"].replace(",", ""), 'initial_correct': row['llm_correct'], 'initial_answer': row['llm_pred_answer']}
+    return {"q_llm_input_ids": q_llm_input_ids, "q_input_ids": q_input_ids, "q_len": len(q_input_ids), "gold_answer": row["gold_answer"], 'initial_correct': row['llm_correct'], 'initial_answer': row['llm_pred_answer']}
 
 
 
@@ -466,17 +469,20 @@ with open(output_file, "w", encoding="utf-8") as log_f:
             total_input = tokenizer.decode(batch_input_ids[i])
             question = tokenizer.decode(batch_input_ids[i][:batch_q_len[i]])
             generated_text = tokenizer.decode(generated_only)
+            generated_answer = math_scorer.extract_pred(generated_text)
             # print(f"Total input: {total_input}\n")
             # print(f"Input question: {question}\n")
             print(f"Generated text: {generated_text}\n")
+            print(f"Generated answer: {generated_answer}\n")
             print(f"Gold answer: {results[batch_start + i]["gold_answer"]}\n")
             # print("\n" + "=" * 80)
-            generated_answer = extract_answer_num(generated_text)
-            is_correct = False
-            if generated_answer is not None and float(generated_answer) == float(results[batch_start + i]["gold_answer"]):
+            
+            is_correct = math_scorer.grade(generated_answer, results[batch_start + i]["gold_answer"])
+            if is_correct:
                 total_correct += 1
-                is_correct = True
             total_processed += 1
+            wandb.log({"accuracy": total_correct/total_processed*100, "refined_probs": total_correct},step=total_processed)
+            
             wandb.log({"accuracy": total_correct/total_processed*100, "refined_probs": total_correct},step=total_processed)
 
             # Persist per-sample log as JSONL
